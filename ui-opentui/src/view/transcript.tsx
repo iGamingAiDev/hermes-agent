@@ -88,7 +88,7 @@ import type { BoxRenderable, ScrollBoxRenderable } from '@opentui/core'
 import { useRenderer } from '@opentui/solid'
 import { createComputed, createMemo, createSelector, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js'
 
-import { envFlag } from '../logic/env.ts'
+import { diagnosticsEnabled, envFlag } from '../logic/env.ts'
 import type { Message, SessionStore } from '../logic/store.ts'
 import {
   computeWindow,
@@ -234,9 +234,10 @@ export function Transcript(props: { store: SessionStore }) {
     if (!streaming) estimates.set(key, estimate)
     return estimate
   }
-  // DEV stats exposure for the bench (HERMES_TUI_WINDOW_STATS): the live
+  // DEV stats exposure for the bench (HERMES_TUI_WINDOW_STATS — defaults to
+  // the HERMES_TUI_DIAGNOSTICS master switch; settable individually): the live
   // current/peak mounted-row counters from logic/window.ts.
-  if (envFlag(process.env.HERMES_TUI_WINDOW_STATS, false)) {
+  if (envFlag(process.env.HERMES_TUI_WINDOW_STATS, diagnosticsEnabled())) {
     ;(globalThis as unknown as Record<string, unknown>)['__hermesTuiWindowStats'] = windowRowStats()
   }
 

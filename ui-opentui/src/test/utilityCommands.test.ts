@@ -22,6 +22,19 @@ import { formatSpawnTree, formatSpawnTreeList, readSpawnTreeEntries } from '../l
 import { clientCommandNames, dispatchSlash, type SlashContext } from '../logic/slash.ts'
 import type { Part } from '../logic/store.ts'
 
+// The utility commands under test are DIAGNOSTIC commands — gated behind
+// HERMES_TUI_DIAGNOSTICS (logic/env.ts). This suite tests the commands
+// themselves, so enable the gate for the whole file (gating behavior has its
+// own tests in slash.test.ts).
+const PREV_DIAG = process.env.HERMES_TUI_DIAGNOSTICS
+beforeEach(() => {
+  process.env.HERMES_TUI_DIAGNOSTICS = '1'
+})
+afterEach(() => {
+  if (PREV_DIAG === undefined) delete process.env.HERMES_TUI_DIAGNOSTICS
+  else process.env.HERMES_TUI_DIAGNOSTICS = PREV_DIAG
+})
+
 // /heapdump must not write a REAL multi-MB snapshot per test run — stub the V8
 // seam; the path/mkdir plumbing still runs for real (under a temp HERMES_HOME).
 vi.mock('node:v8', () => ({ writeHeapSnapshot: vi.fn((path?: string) => path ?? 'unnamed.heapsnapshot') }))

@@ -16,6 +16,21 @@ export function envFlag(value: string | undefined, fallback: boolean): boolean {
 }
 
 /**
+ * The diagnostics master switch — `HERMES_TUI_DIAGNOSTICS` (default OFF).
+ *
+ * Gates the developer/profiling surface a regular user should never trip
+ * over: the diagnostic slash commands (`/mem`, `/heapdump`) and the default
+ * for `HERMES_TUI_WINDOW_STATS` (which can still be set individually). It is
+ * an enable switch, not a secret: anyone CAN set it (support flows say
+ * "relaunch with HERMES_TUI_DIAGNOSTICS=1"), it just keeps the day-to-day
+ * surface clean. Read per call so tests (and long-lived processes whose
+ * wrapper mutates env before launch) see the live value.
+ */
+export function diagnosticsEnabled(): boolean {
+  return envFlag(process.env.HERMES_TUI_DIAGNOSTICS, false)
+}
+
+/**
  * Parse `HERMES_TUI_TOOL_OUTPUT_LINES` (a TUI-only env var — deliberately NOT
  * a config.yaml knob): how many output lines an expanded tool body shows.
  * UNSET → Infinity (UNLIMITED — expanded tool output is uncapped by default;

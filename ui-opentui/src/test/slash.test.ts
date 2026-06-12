@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from 'vitest'
 import type { DetailsMode } from '../logic/details.ts'
 import {
   buildModelTabs,
+  clientCommandNames,
   dispatchSlash,
   mapCompletions,
   parseSlash,
@@ -564,5 +565,42 @@ describe('dispatchSlash — server ladder', () => {
     })
     await dispatchSlash('/whatever', p.ctx)
     expect(p.system).toContain('done')
+  })
+})
+
+describe('diagnostic command gating (HERMES_TUI_DIAGNOSTICS)', () => {
+  const KEY = 'HERMES_TUI_DIAGNOSTICS'
+  const prev = process.env[KEY]
+  afterEach(() => {
+    if (prev === undefined) delete process.env[KEY]
+    else process.env[KEY] = prev
+  })
+
+  test('OFF (default): /mem and /heapdump respond with the enable hint, not the command', async () => {
+    delete process.env[KEY]
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/mem', p.ctx)
+    await dispatchSlash('/heapdump', p.ctx)
+    expect(p.system[0]).toContain('HERMES_TUI_DIAGNOSTICS=1')
+    expect(p.system[1]).toContain('HERMES_TUI_DIAGNOSTICS=1')
+    expect(p.calls).toHaveLength(0) // never reached the gateway ladder either
+  })
+
+  test('OFF: the diagnostic names are absent from clientCommandNames()', () => {
+    delete process.env[KEY]
+    const names = clientCommandNames()
+    expect(names).not.toContain('mem')
+    expect(names).not.toContain('heapdump')
+    expect(names).toContain('logs') // non-diagnostic neighbors stay
+  })
+
+  test('ON: /mem executes (live memory stats), names are listed', async () => {
+    process.env[KEY] = '1'
+    expect(clientCommandNames()).toContain('mem')
+    expect(clientCommandNames()).toContain('heapdump')
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/mem', p.ctx)
+    const out = [...p.system, ...p.paged.map(x => x.text)].join('\n')
+    expect(out).toMatch(/rss|heap/i)
   })
 })
