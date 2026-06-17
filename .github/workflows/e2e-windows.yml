@@ -240,7 +240,7 @@ jobs:
               FileAppend("ERROR: Hermes installer window did not appear within 30s`n", "ahk.log")
               ExitApp(1)
           }
-          
+
           Sleep(1000)
 
           WinGetPos(&x, &y, &w, &h, winTitle)
@@ -333,21 +333,13 @@ jobs:
             }
           }
 
-      - name: Normalize recording filename for artifact
-        if: always()
-        shell: pwsh
-        run: |
-          if (Test-Path recording.mkv) {
-            Move-Item -Path recording.mkv -Destination screen-recording.mkv
-          }
-
       - name: Upload screen recording
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         id: upload-recording
         if: always()
         with:
           name: screen-recording
-          path: screen-recording.mkv
+          path: recording.mkv
           if-no-files-found: ignore
           archive: false
           overwrite: true
@@ -360,7 +352,7 @@ jobs:
         run: |
           "## E2E screen recording" >> $env:GITHUB_STEP_SUMMARY
           "" >> $env:GITHUB_STEP_SUMMARY
-          "[download screen-recording.mkv]($($env:ARTIFACT_URL))" >> $env:GITHUB_STEP_SUMMARY
+          "[download recording.mkv]($($env:ARTIFACT_URL))" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Upload AHK logs and script
         uses: actions/upload-artifact@v4
