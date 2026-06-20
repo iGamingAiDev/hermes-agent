@@ -184,8 +184,8 @@ jobs:
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = "ffmpeg"
           $psi.Arguments = "-y -f gdigrab -framerate 15 -i desktop -t 600 " +
-                           "-hide_banner -loglevel error"
-                           "-c:v libx264 -preset ultrafast -pix_fmt yuv420p recording.mkv" +
+                           "-hide_banner -loglevel error" +
+                           "-c:v libx264 -preset ultrafast -pix_fmt yuv420p recording.mkv"
           $psi.RedirectStandardInput = $true
           $psi.UseShellExecute = $false
           $ffmpeg = [System.Diagnostics.Process]::Start($psi)
