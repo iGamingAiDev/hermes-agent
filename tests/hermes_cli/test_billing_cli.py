@@ -52,11 +52,9 @@ def test_billing_overview_non_interactive_renders_text_not_modal(cli, monkeypatc
     monkeypatch.setattr(bv, "build_billing_state", lambda *a, **kw: state)
     cli._show_billing("/billing")
     out = capsys.readouterr().out
-    assert "Usage credits" in out
-    assert "$142.50" in out
-    assert "$180 of $1000 used (default ceiling)" in out
-    # New design: a spend bar with a percentage on the overview.
-    assert "%" in out and ("█" in out or "░" in out)
+    # Balance now leads in the title; dollars, never "credits".
+    assert "Top up · balance $142.50" in out
+    assert "credits" not in out.lower()
     # ZERO sub-commands: no /billing buy|auto-reload|limit advertising.
     assert "/billing buy" not in out
     assert "Actions:" not in out
@@ -115,8 +113,8 @@ def test_billing_sub_arg_ignored_opens_overview(cli, monkeypatch, capsys):
     monkeypatch.setattr(bv, "build_billing_state", lambda *a, **kw: state)
     cli._show_billing("/billing buy")  # arg is ignored
     out = capsys.readouterr().out
-    assert "Usage credits" in out  # overview, NOT the buy screen
-    assert "Buy usage credits" not in out
+    assert "Top up · balance" in out  # overview, NOT the buy screen
+    assert "Add funds" not in out  # the buy screen header isn't shown
 
 
 def test_billing_buy_non_interactive_defers_to_portal(cli, monkeypatch, capsys):
@@ -131,6 +129,6 @@ def test_billing_buy_non_interactive_defers_to_portal(cli, monkeypatch, capsys):
     # Reached via the menu in real use; non-interactively it defers to the portal.
     cli._billing_buy_flow(state)
     out = capsys.readouterr().out
-    assert "Buy usage credits" in out
+    assert "Add funds" in out
     assert "$25" in out and "$50" in out and "$100" in out
     assert "interactive CLI" in out  # defers; no charge attempted non-interactively

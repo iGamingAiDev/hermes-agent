@@ -9295,24 +9295,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         print(f"  Manage on portal: {url}")
 
     def _billing_overview(self, state):
-        """Screen 1 — overview: balance, spend bar, role-gated action menu."""
+        """Screen 1 — overview: balance in title, two-bar dollar usage, action menu.
+
+        Dollars-only (no "credits") — mirrors the TUI /topup overlay: balance
+        leads in the title, the shared plan + top-up bars render below, then the
+        reordered menu (Add funds first). No scope preflight — terminal billing
+        is discovered reactively when a charge 403s insufficient_scope.
+        """
         from agent.billing_view import format_money
 
+        # Shared dollar usage model (plan + top-up bars), same source as /usage.
+        try:
+            from agent.billing_usage import build_usage_model
+
+            usage = build_usage_model()
+        except Exception:
+            usage = None
+
         print()
-        _cprint(f"  💳 {_b('Usage credits')}")
+        _cprint(f"  💳 {_b(f'Top up · balance {format_money(state.balance_usd)}')}")
+        if state.org_name:
+            role = (state.role or "").title()
+            _org_line = f"Org: {state.org_name}{f' · {role}' if role else ''}"
+            _cprint(f"  {_d(_org_line)}")
         print(f"  {'─' * 41}")
 
-        cap = state.monthly_cap
-        if cap is not None and cap.limit_usd is not None:
-            spent = format_money(cap.spent_this_month_usd)
-            limit = format_money(cap.limit_usd)
-            ceiling = " (default ceiling)" if cap.is_default_ceiling else ""
-            bar, pct = self._billing_spend_bar(
-                cap.spent_this_month_usd, cap.limit_usd
-            )
-            print(f"  {spent} of {limit} used{ceiling}   {bar} {pct}%")
-
-        print(f"  Balance: {format_money(state.balance_usd)}")
+        # Two-bar dollar usage view (plan name on the plan bar; top-up below).
+        pb = getattr(usage, "plan_bar", None) if usage else None
+        if pb is not None and pb.total_usd > 0:
+            bar, _ = self._billing_spend_bar(pb.spent_usd, pb.total_usd)
+            _pct_s = f" · {pb.pct_used}% used" if pb.pct_used is not None else ""
+            _label = (getattr(usage, "plan_name", None) or "plan").ljust(8)[:8]
+            print(f"  {_label}[{bar}]  ${pb.remaining_usd:,.2f} left of ${pb.total_usd:,.2f}{_pct_s}")
+        tb = getattr(usage, "topup_bar", None) if usage else None
+        if tb is not None and tb.remaining_usd > 0:
+            print(f"  {'top-up'.ljust(8)}[{'█' * 10}]  ${tb.remaining_usd:,.2f} · never expires")
 
         ar = state.auto_reload
         if ar is not None:
@@ -9323,11 +9340,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 )
             else:
                 print("  Auto-reload: off")
-
-        if state.org_name:
-            role = (state.role or "").title()
-            _org_line = f"Org: {state.org_name}{f' · {role}' if role else ''}"
-            _cprint(f"  {_d(_org_line)}")
         print(f"  {'─' * 41}")
 
         # Action gating: admin + kill-switch for charge/auto-reload; everyone gets portal.
@@ -9337,12 +9349,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             return
         if not state.cli_billing_enabled:
             _cprint(f"  {_d('Terminal billing is turned off for this org.')}")
-            self._billing_portal_hint(state, reason="Enable it on the portal to buy credits here.")
+            self._billing_portal_hint(state, reason="Enable it on the portal to add funds here.")
             return
 
         # Optimistic funnel: no card on file → a charge will 403 no_payment_method.
-        # Surface that up front (with the portal link) but DON'T hide Buy — /state.card
-        # can't fully prove CLI-chargeability, so we advise rather than gate.
+        # Surface that up front (with the portal link) but DON'T hide Add funds —
+        # the card field can't fully prove chargeability, so we advise not gate.
         if state.card is None:
             _cprint(
                 f"  {_d('No saved card for terminal charges yet — set one up on the portal first.')}"
@@ -9355,17 +9367,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._billing_portal_hint(state)
             return
 
+        # Add funds first, then settings, then the scopeless browser handoff.
+        # No "Enable terminal billing" item — that's discovered at pay time.
         choices = [
-            ("buy", "Buy credits", "purchase a one-time credit top-up"),
-            ("auto", "Adjust auto-reload", "configure automatic top-ups"),
-            ("limit", "Adjust monthly limit", "show the monthly spend cap (read-only)"),
+            ("buy", "Add funds", "add money to your balance"),
+            ("auto", "Auto-reload", "configure automatic top-ups"),
+            ("limit", "Monthly limit", "show the monthly spend cap (read-only)"),
             ("portal", "Manage on portal", "open the billing page in your browser"),
             ("cancel", "Cancel", "do nothing"),
         ]
         # The overview summary is already printed above; the modal only needs to
         # present the action menu — repeating the title/balance reads as a dupe.
         raw = self._prompt_text_input_modal(
-            title="💳 Choose an action", detail="",
+            title="💳 Top up your balance", detail="",
             choices=choices,
         )
         choice = self._normalize_slash_confirm_choice(raw, choices)
@@ -9378,7 +9392,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif choice == "portal":
             self._billing_open_portal(state)
         else:
-            print("  🟡 Cancelled.")
+            print("  Cancelled.")
 
     def _billing_spend_bar(self, spent, limit, *, cells: int = 10):
         """Render a 10-cell `█`/`░` spend bar + integer percent from spent/limit.
@@ -9445,7 +9459,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if not getattr(self, "_app", None):
             presets = ", ".join(format_money(p) for p in state.charge_presets)
             print()
-            _cprint(f"  💳 {_b('Buy usage credits')}")
+            _cprint(f"  💳 {_b('Add funds')}")
             print(f"  Presets: {presets}")
             print("  Run this in the interactive CLI to complete a purchase.")
             self._billing_portal_hint(state)
@@ -9460,11 +9474,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         card = state.card
         detail = f"Payment: {card.masked}" if card else "No saved card on file"
         raw = self._prompt_text_input_modal(
-            title="💳 Buy usage credits", detail=detail, choices=preset_choices,
+            title="💳 Add funds", detail=detail, choices=preset_choices,
         )
         choice = self._normalize_slash_confirm_choice(raw, preset_choices)
         if not choice or choice == "cancel":
-            print("  🟡 Cancelled. No credits added.")
+            print("  Cancelled. No funds added.")
             return
 
         from decimal import Decimal
@@ -9473,7 +9487,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             entered = self._prompt_text_input("  Amount (USD): ")
             if entered is None:
                 # None = cancelled (e.g. slash-worker can't prompt off-thread).
-                print("  🟡 Cancelled. No credits added.")
+                print("  Cancelled. No funds added.")
                 return
             v = validate_charge_amount(
                 entered or "", min_usd=state.min_usd, max_usd=state.max_usd
@@ -9522,7 +9536,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         )
         choice = self._normalize_slash_confirm_choice(raw, confirm_choices)
         if choice != "pay":
-            print("  🟡 Cancelled. No credits added.")
+            print("  Cancelled. No funds added.")
             return
 
         # Submit the charge with a fresh idempotency key (reused on retry).
@@ -9536,7 +9550,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         try:
             result = post_charge(amount_usd=amount, idempotency_key=key)
         except BillingScopeRequired:
-            self._billing_handle_scope_required(state)
+            # In-flight reauth: enable terminal billing, then resume THIS charge
+            # (press-Enter beat) — no command re-run. Reuses the same idem key.
+            self._billing_handle_scope_required(state, amount=amount, idempotency_key=key)
             return
         except BillingError as exc:
             self._billing_render_charge_error(state, exc)
@@ -9580,7 +9596,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 from agent.billing_view import parse_money
 
                 shown = format_money(parse_money(amt)) if amt else format_money(amount)
-                print(f"  ✅ {shown} in credits added.")
+                print(f"  ✓ {shown} added to your balance.")
                 return
             if state_str == "failed":
                 self._billing_render_charge_failed(state, status.get("reason"))
@@ -9631,9 +9647,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                   "portal (one-time credit buys don't save a reusable card).")
         elif code in ("cli_billing_disabled", "remote_spending_disabled") or \
                 getattr(exc, "code", None) == "remote_spending_disabled":
-            print("  🔴 Remote Spending is off for this account — an admin must enable it on the portal.")
+            print("  Terminal billing is off for this account — an admin must enable it on the portal.")
         elif code == "role_required":
-            print("  🔴 Buying credits needs an org admin/owner. Ask an admin, or manage on the portal.")
+            print("  Adding funds needs an org admin/owner. Ask an admin, or manage on the portal.")
         elif code == "idempotency_conflict":
             print("  🔴 That charge key was already used for a different amount. Start a fresh top-up.")
         elif code == "monthly_cap_exceeded":
@@ -9651,55 +9667,101 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if portal_url:
             print(f"  Portal: {portal_url}")
 
-    def _billing_handle_scope_required(self, state):
-        """403 insufficient_scope → lazy step-up re-auth (plan D-A)."""
+    def _billing_handle_scope_required(self, state, *, amount=None, idempotency_key=None):
+        """403 insufficient_scope → in-flight reauth, then resume the held charge.
+
+        The buy path discovers terminal billing isn't enabled only when the
+        charge 403s — there is no preflight. We enable it in-flight ("Enable
+        terminal billing" → browser device-flow), then on return ask the user to
+        press Enter to resume the held ``amount`` (reusing ``idempotency_key`` so
+        the resumed charge collapses with the original). Never leaks the raw
+        billing:manage scope.
+        """
+        from agent.billing_view import format_money
+
+        amount_str = format_money(amount) if amount is not None else "your top-up"
         print()
-        print("  💳 Terminal billing needs an extra permission (billing:manage).")
-        _scope_msg = (
-            "An org admin/owner must tick \"Allow terminal billing\" during "
-            "login."
-        )
-        _cprint(f"  {_d(_scope_msg)}")
+        print("  ! One-time setup")
+        _cprint(f"  {_d(f'To charge this terminal, enable terminal billing once. It opens your browser to authorize, then {amount_str} picks up right here.')}")
         if not getattr(self, "_app", None):
-            print("  Run `hermes portal` and approve terminal billing, then retry.")
+            print("  Run `hermes portal` and enable terminal billing, then retry.")
             return
         confirm_choices = [
-            ("yes", "Re-authorize now", "open the portal to grant billing access"),
+            ("yes", "Enable terminal billing", "open your browser to authorize"),
             ("no", "Not now", "cancel"),
         ]
         raw = self._prompt_text_input_modal(
-            title="💳 Grant terminal billing access?",
-            detail="Opens the portal device-authorization page.",
+            title="💳 Enable terminal billing",
+            detail="Opens your browser to authorize this terminal.",
             choices=confirm_choices,
         )
         choice = self._normalize_slash_confirm_choice(raw, confirm_choices)
         if choice != "yes":
-            print("  🟡 Cancelled.")
+            print("  No charge made. Run /topup when you want to enable terminal billing.")
             return
+        print("  Opening your browser to enable terminal billing…")
         try:
             from hermes_cli.auth import step_up_nous_billing_scope
 
             granted = step_up_nous_billing_scope(open_browser=True)
         except Exception as exc:
-            print(f"  🔴 Re-authorization failed: {exc}")
+            print(f"  Couldn't enable terminal billing: {exc}")
             return
-        if granted:
-            print("  ✅ Billing permission granted.")
-            # Step-up only grants the billing:manage TOKEN scope; the ORG
-            # kill-switch (cli_billing_enabled) is a separate gate. Re-fetch
-            # /state so we don't over-promise when a charge would still hit
-            # cli_billing_disabled.
-            from agent.billing_view import build_billing_state
+        if not granted:
+            print("  Couldn't enable terminal billing — an org admin or owner has to approve it. Your card was not charged.")
+            return
 
-            fresh = build_billing_state()
-            if fresh.logged_in and fresh.cli_billing_enabled:
-                print("  Run /billing buy again to continue.")
-            else:
-                print("  🟡 Permission granted, but terminal billing is still turned "
-                      "off for this org. Enable it in the portal, then run /billing again.")
-                self._billing_portal_hint(fresh)
-        else:
-            print("  🟡 Terminal billing was not granted (an admin must tick the box).")
+        # Granted. The token now carries the scope, but the ORG kill-switch
+        # (cli_billing_enabled) is a separate gate — re-fetch /state so we don't
+        # over-promise when a charge would still hit cli_billing_disabled.
+        from agent.billing_view import build_billing_state
+
+        fresh = build_billing_state()
+        if not (fresh.logged_in and fresh.cli_billing_enabled):
+            print("  Terminal billing was enabled for this terminal, but it's still turned off for this org. Enable it in the portal, then run /topup again.")
+            self._billing_portal_hint(fresh)
+            return
+
+        # Nothing to resume (scope-required hit outside a charge, e.g. auto-reload
+        # config) → just tell the user it's ready.
+        if amount is None:
+            print("  ✓ Terminal billing enabled. Run /topup to continue.")
+            return
+
+        # Press-Enter beat: the user is back from the browser; resume the held
+        # purchase on an explicit confirm (reassuring, not silent).
+        print("  ✓ Terminal billing enabled.")
+        resume_choices = [
+            ("resume", f"Resume {format_money(amount)} top-up", "finish the held purchase"),
+            ("cancel", "Cancel", "do not charge"),
+        ]
+        raw = self._prompt_text_input_modal(
+            title="💳 Resume your top-up",
+            detail=f"{format_money(amount)} is ready to finish — press Enter to resume.",
+            choices=resume_choices,
+        )
+        if self._normalize_slash_confirm_choice(raw, resume_choices) != "resume":
+            print("  Cancelled. No funds added.")
+            return
+
+        # Replay the held charge, reusing the original idempotency key so a
+        # double-submit collapses to one charge.
+        from hermes_cli.nous_billing import BillingError, post_charge
+
+        from agent.billing_view import new_idempotency_key
+
+        key = idempotency_key or new_idempotency_key()
+        try:
+            result = post_charge(amount_usd=amount, idempotency_key=key)
+        except BillingError as exc:
+            self._billing_render_charge_error(fresh, exc)
+            return
+        charge_id = result.get("chargeId")
+        if not charge_id:
+            print("  No charge id returned; please check the portal.")
+            return
+        _cprint(f"  {_d('Resuming your top-up — confirming settlement…')}")
+        self._billing_poll_charge(fresh, charge_id, amount)
 
     def _billing_auto_reload_flow(self, state):
         """Screen 4 — auto-reload config: threshold + reload-to → PATCH.
@@ -9720,7 +9782,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         print()
         _cprint(f"  💳 {_b('Auto-reload')}")
         print(f"  {'─' * 41}")
-        _cprint(f"  {_d('Automatically buy more credits when your balance is low.')}")
+        _cprint(f"  {_d('Automatically add funds when your balance is low.')}")
         if card:
             print(f"  Card on file: {card.masked}")
         else:
