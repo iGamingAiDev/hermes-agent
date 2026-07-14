@@ -1,9 +1,10 @@
 """Unit tests for scripts/docker_rebootstrap_nous_session.py.
 
 The boot-time re-seed is the load-bearing "does not clobber a healthy session"
-guard: it must overwrite the on-disk Nous provider entry ONLY when that entry is
-provably terminal (quarantine marker + no usable tokens), and no-op in every
-other case. These are pure-stdlib tmp_path tests (no container build).
+guard: it may overwrite the on-disk Nous provider entry when that entry is
+provably terminal (quarantine marker + no usable tokens), or when an
+orchestrator seed is demonstrably newer. Older/incomparable seeds must no-op.
+These are pure-stdlib tmp_path tests (no container build).
 """
 from __future__ import annotations
 
@@ -86,6 +87,92 @@ def test_marker_but_live_token_is_not_terminal(tmp_path):
     state["refresh_token"] = "somehow-live"
     auth = _write_auth(tmp_path, {"nous": state})
     assert mod.reseed_if_terminal(auth, _FRESH_SEED) == "not_terminal"
+
+
+def test_reseeds_newer_orchestrator_session_over_healthy_stale_entry(tmp_path):
+    """A newer orchestrator-issued session replaces the healthy local session.
+
+    NAS revokes the old session before restarting a hosted agent.  Refusing the
+    re-seed merely because the local entry still has tokens leaves that revoked
+    session in place and guarantees ``invalid_grant`` on its next refresh.
+    """
+    auth = _write_auth(tmp_path, {"nous": {
+        **_healthy_nous_state(),
+        "obtained_at": "2026-07-14T19:00:00+00:00",
+    }})
+    seed = json.dumps({
+        "version": 1,
+        "providers": {
+            "nous": {
+                "portal_base_url": "https://portal.example.com",
+                "client_id": "hermes-cli-vps",
+                "access_token": "FRESH-at",
+                "refresh_token": "FRESH-rt",
+                "obtained_at": "2026-07-14T19:05:00+00:00",
+            }
+        },
+    })
+
+    assert mod.reseed_if_terminal(auth, seed) == "reseeded_newer"
+    store = json.loads(Path(auth).read_text())
+    assert store["providers"]["nous"]["refresh_token"] == "FRESH-rt"
+
+
+def test_does_not_replace_healthy_entry_with_older_seed(tmp_path):
+    auth = _write_auth(tmp_path, {"nous": {
+        **_healthy_nous_state(),
+        "obtained_at": "2026-07-14T19:05:00+00:00",
+    }})
+    seed = json.dumps({
+        "version": 1,
+        "providers": {
+            "nous": {
+                "access_token": "STALE-at",
+                "refresh_token": "STALE-rt",
+                "obtained_at": "2026-07-14T19:00:00+00:00",
+            }
+        },
+    })
+
+    assert mod.reseed_if_terminal(auth, seed) == "not_terminal"
+    store = json.loads(Path(auth).read_text())
+    assert store["providers"]["nous"]["refresh_token"] == "live-rt"
+
+
+def test_reseeds_when_timestamps_mix_naive_and_aware_iso_formats(tmp_path):
+    auth = _write_auth(tmp_path, {"nous": {
+        **_healthy_nous_state(),
+        "obtained_at": "2026-07-14T19:00:00",
+    }})
+    seed = json.dumps({
+        "providers": {
+            "nous": {
+                "access_token": "FRESH-at",
+                "refresh_token": "FRESH-rt",
+                "obtained_at": "2026-07-14T19:05:00Z",
+            }
+        },
+    })
+
+    assert mod.reseed_if_terminal(auth, seed) == "reseeded_newer"
+
+
+def test_malformed_timestamp_does_not_clobber_healthy_entry(tmp_path):
+    auth = _write_auth(tmp_path, {"nous": {
+        **_healthy_nous_state(),
+        "obtained_at": "not-a-time",
+    }})
+    seed = json.dumps({
+        "providers": {
+            "nous": {
+                "access_token": "FRESH-at",
+                "refresh_token": "FRESH-rt",
+                "obtained_at": "2026-07-14T19:05:00Z",
+            }
+        },
+    })
+
+    assert mod.reseed_if_terminal(auth, seed) == "not_terminal"
 
 
 def test_preserves_other_providers(tmp_path):

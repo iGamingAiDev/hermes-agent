@@ -19,9 +19,11 @@ already has an auth.json.
 This script is the narrow, safe exception. An orchestrator that manages the
 container can supply a freshly-issued bootstrap session via
 ``HERMES_AUTH_JSON_REBOOTSTRAP`` (plus a restart). On boot we re-seed the Nous
-provider entry from that env **only when the on-disk Nous entry is provably
-terminal** (the quarantine marker above with no usable tokens left). Every other
-case is a no-op, so we never clobber a healthy or merely-rotating session.
+provider entry from that env when the on-disk entry is provably terminal, or
+when the orchestrator seed's ``obtained_at`` is newer than the local session.
+The latter matters because an orchestrator may revoke the previous session
+before restart while its still-present local tokens look healthy. Older or
+incomparable seeds remain no-ops, so a retained env cannot roll auth backward.
 
 Design constraints
 ------------------
@@ -37,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 # Env var the orchestrator sets to the re-seed payload. Deliberately DISTINCT
@@ -87,6 +90,39 @@ def _extract_nous_from_seed(seed_raw: str) -> Optional[dict]:
     return nous
 
 
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    """Parse an OAuth timestamp without guessing when either side is malformed."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _seed_is_newer(local_nous: Any, seed_nous: dict) -> bool:
+    """Whether NAS supplied a bootstrap session newer than the local one.
+
+    NAS mints the replacement before restarting the machine and revokes the
+    previous session.  A healthy-looking local entry can therefore already be
+    stale.  ``obtained_at`` is the server-issued ordering signal that lets boot
+    apply a genuinely newer replacement without allowing an old retained env
+    value to roll credentials back on later restarts.
+    """
+    if not isinstance(local_nous, dict):
+        return False
+    local_obtained = _parse_timestamp(local_nous.get("obtained_at"))
+    seed_obtained = _parse_timestamp(seed_nous.get("obtained_at"))
+    return bool(
+        local_obtained is not None
+        and seed_obtained is not None
+        and seed_obtained > local_obtained
+    )
+
+
 def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
     """Core logic. Returns a short status string for logging/testing:
 
@@ -95,8 +131,9 @@ def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
       - "no_auth_file"     — auth.json absent (blank volume → let the normal
                              HERMES_AUTH_JSON_BOOTSTRAP path handle it)
       - "auth_unreadable"  — auth.json present but unparseable (leave as-is)
-      - "not_terminal"     — on-disk nous entry is healthy/absent → no-op
-      - "reseeded"         — nous entry was terminal; replaced from seed
+      - "not_terminal"     — local entry is healthy and at least as new → no-op
+      - "reseeded"         — terminal entry replaced from seed
+      - "reseeded_newer"   — healthy-but-stale entry replaced by a newer seed
     """
     if not seed_raw:
         return "no_seed"
@@ -125,10 +162,12 @@ def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
         providers = {}
         store["providers"] = providers
 
-    if not _nous_entry_is_terminal(providers.get("nous")):
-        # Healthy, rotating, or absent nous entry — the load-bearing guard.
-        # Never clobber a good session; this is what makes the re-seed safe to
-        # push on every restart.
+    local_nous = providers.get("nous")
+    terminal = _nous_entry_is_terminal(local_nous)
+    newer_seed = _seed_is_newer(local_nous, seed_nous)
+    if not terminal and not newer_seed:
+        # Healthy and at least as new as the seed, or incomparable. Never roll a
+        # session back merely because an old rebootstrap env remains configured.
         return "not_terminal"
 
     # Surgical replacement: swap ONLY providers.nous, preserve everything else.
@@ -142,7 +181,7 @@ def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
         os.chmod(auth_path, 0o600)
     except OSError:
         pass
-    return "reseeded"
+    return "reseeded" if terminal else "reseeded_newer"
 
 
 def main() -> int:
@@ -160,6 +199,9 @@ def main() -> int:
 
     if result == "reseeded":
         print("[rebootstrap] Nous bootstrap session was terminal; re-seeded auth.json from "
+              f"{REBOOTSTRAP_ENV}")
+    elif result == "reseeded_newer":
+        print("[rebootstrap] Applied newer orchestrator-issued Nous bootstrap session from "
               f"{REBOOTSTRAP_ENV}")
     else:
         # Quiet by default for the common no-op cases; still emit a breadcrumb.
