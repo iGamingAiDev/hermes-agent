@@ -6,6 +6,7 @@ import copy
 import contextlib
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import time
@@ -119,7 +120,7 @@ def _bounded_list(value: Any, field: str, *, maximum: int, item_max: int,
 
 
 def _aggregate(request: dict[str, Any]) -> None:
-    encoded = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    encoded = json.dumps(request, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
                          allow_nan=False).encode("utf-8")
     if len(encoded) > MAX_AGGREGATE_BYTES:
         raise ProgramControlError("request_too_large")
@@ -177,7 +178,8 @@ def _store(conn: sqlite3.Connection, root: str, action: str, key: str,
 
 
 def _mutation(conn: sqlite3.Connection, request: dict[str, Any], action: str,
-              expected_field: str, operation: Callable[[int], dict[str, Any]]) -> dict[str, Any]:
+              expected_field: str, operation: Callable[[int], dict[str, Any]],
+              replay_validator: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
     fingerprint = _canonical(request, {"idempotency_key", expected_field})
     nested = conn.in_transaction
     if nested:
@@ -187,6 +189,11 @@ def _mutation(conn: sqlite3.Connection, request: dict[str, Any], action: str,
     try:
         replay = _replay(conn, request["root_id"], action, request["idempotency_key"], fingerprint)
         if replay is not None:
+            # Replay is not merely a request-log lookup: callers whose success
+            # depends on durable artifacts revalidate those artifacts while the
+            # same write lock/savepoint is held.
+            if replay_validator is not None:
+                replay_validator(replay)
             if nested:
                 conn.execute("RELEASE SAVEPOINT program_control_mutation")
             else:
@@ -213,7 +220,179 @@ _OPTION_KEYS = {"option_id", "label", "summary", "benefits", "risks", "reversibi
                 "security_impact", "cost_impact", "operations_impact"}
 _OPEN_KEYS = {"root_id", "checkpoint_id", "node_id", "title", "options",
               "recommended_option_id", "recommendation_rationale", "affected_node_ids",
-              "expected_node_version", "idempotency_key", "actor"}
+              "expected_node_version", "idempotency_key", "actor", "public_brief"}
+
+_PUBLIC_BRIEF_KEYS = {"title", "recommendation_rationale", "recommended_option_id", "options"}
+_PUBLIC_OPTION_KEYS = _OPTION_KEYS | {"ordinal"}
+_PUBLIC_DISCLOSURE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\b[a-z][a-z0-9+.-]{1,31}:(?://|[^\s])", r"\b(?:mailto|tel|file|data|ssh):",
+    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+    r"(?:^|[\s(])/(?:[^\s/]+/)*[^\s/]+", r"\b[A-Z]:\\", r"(?:^|\s)~/",
+    r"-----BEGIN [^-]*(?:PRIVATE KEY|SECRET)[^-]*-----",
+    r"\b(?:bearer|basic)\s+[A-Z0-9._~+/=-]{8,}",
+    r"\b(?:auth(?:orization)?|token|api[-_ ]?key|password|secret)\b\s*(?:[:=]|\s)\s*\S{8,}",
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+    r"\b[0-9a-f]{48,}\b", r"\b(?=[A-Za-z0-9+/=_-]{48,}\b)(?=[A-Za-z0-9+/=_-]*\d)[A-Za-z0-9+/=_-]+\b",
+))
+_PUBLIC_BLOB_TOKEN = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{48,}(?![A-Za-z0-9+/=_-])")
+_PUBLIC_SCHEMA_VERSION = 1
+_PUBLIC_SCANNER_POLICY_VERSION = 1
+_PUBLIC_MAX_CODEPOINTS = 20_000
+_PUBLIC_MAX_UTF8_BYTES = 80_000
+
+
+def _looks_like_high_entropy_blob(value: str) -> bool:
+    for match in _PUBLIC_BLOB_TOKEN.finditer(value):
+        token = match.group(0).rstrip("=")
+        if not token:
+            return True
+        counts = {char: token.count(char) for char in set(token)}
+        entropy = -sum((count / len(token)) * math.log2(count / len(token))
+                       for count in counts.values())
+        if entropy >= 4.0:
+            return True
+    return False
+
+
+def _public_string(value: Any, *, maximum: int) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= maximum:
+        raise ProgramControlError("invalid_public_brief_text")
+    if unicodedata.normalize("NFC", value) != value:
+        raise ProgramControlError("invalid_public_brief_text")
+    for char in value:
+        code = ord(char)
+        category = unicodedata.category(char)
+        if (category in {"Cc", "Cf", "Cs", "Co"}
+                or 0xFDD0 <= code <= 0xFDEF or (code & 0xFFFF) in {0xFFFE, 0xFFFF}):
+            raise ProgramControlError("invalid_public_brief_text")
+    if (any(pattern.search(value) for pattern in _PUBLIC_DISCLOSURE_PATTERNS)
+            or _looks_like_high_entropy_blob(value)):
+        raise ProgramControlError("public_brief_disclosure")
+    return value
+
+
+def _public_brief(value: Any) -> tuple[dict[str, Any], str]:
+    if not isinstance(value, dict):
+        raise ProgramControlError("invalid_public_brief")
+    _exact(value, _PUBLIC_BRIEF_KEYS)
+    value["title"] = _public_string(value["title"], maximum=200)
+    value["recommendation_rationale"] = _public_string(value["recommendation_rationale"], maximum=1000)
+    value["recommended_option_id"] = _string(
+        value["recommended_option_id"], "public_brief", identifier=True
+    )
+    _public_string(value["recommended_option_id"], maximum=128)
+    if not isinstance(value["options"], list) or not 2 <= len(value["options"]) <= 4:
+        raise ProgramControlError("invalid_public_brief")
+    for ordinal, option in enumerate(value["options"]):
+        if not isinstance(option, dict):
+            raise ProgramControlError("invalid_public_brief")
+        _exact(option, _PUBLIC_OPTION_KEYS)
+        option["option_id"] = _string(option["option_id"], "public_brief", identifier=True)
+        _public_string(option["option_id"], maximum=128)
+        if isinstance(option["ordinal"], bool) or not isinstance(option["ordinal"], int):
+            raise ProgramControlError("invalid_public_brief")
+        if option["ordinal"] != ordinal:
+            raise ProgramControlError("invalid_public_brief")
+        option["label"] = _public_string(option["label"], maximum=200)
+        for field in ("summary", "security_impact", "cost_impact", "operations_impact"):
+            option[field] = _public_string(option[field], maximum=1000)
+        for field in ("benefits", "risks"):
+            if not isinstance(option[field], list) or not 1 <= len(option[field]) <= 10:
+                raise ProgramControlError("invalid_public_brief")
+            option[field] = [_public_string(item, maximum=500) for item in option[field]]
+            if len(set(option[field])) != len(option[field]):
+                raise ProgramControlError("invalid_public_brief")
+        if option["reversibility"] not in {"reversible", "partially_reversible", "irreversible"}:
+            raise ProgramControlError("invalid_public_brief")
+    canonical = {
+        "kind": "hermes_program_decision_public_brief",
+        "schema_version": _PUBLIC_SCHEMA_VERSION,
+        "scanner_policy_version": _PUBLIC_SCANNER_POLICY_VERSION,
+        "classification": "operator_visible",
+        **value,
+    }
+    # This is a best-effort accidental-disclosure gate, never a declassifier
+    # or proof that content is secret-free. Scan one canonical window as well
+    # as individual fields so recognizable tokens split across adjacent public
+    # values are caught. The digest below is integrity bookkeeping only; an
+    # unkeyed SHA-256 digest provides neither confidentiality nor authenticity.
+    def strings(item: Any, *, keys: bool = True):
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if keys:
+                    yield str(key)
+                yield from strings(child, keys=keys)
+        elif isinstance(item, list):
+            for child in item:
+                yield from strings(child, keys=keys)
+        elif isinstance(item, str):
+            yield item
+    window = " ".join(strings(canonical))
+    values_window = " ".join(strings(canonical, keys=False))
+    if (len(window) > _PUBLIC_MAX_CODEPOINTS
+            or len(window.encode("utf-8")) > _PUBLIC_MAX_UTF8_BYTES):
+        raise ProgramControlError("invalid_public_brief")
+    if (any(pattern.search(candidate) for candidate in (window, values_window)
+            for pattern in _PUBLIC_DISCLOSURE_PATTERNS)
+            or _looks_like_high_entropy_blob(window)
+            or _looks_like_high_entropy_blob(values_window)):
+        raise ProgramControlError("public_brief_disclosure")
+    digest = hashlib.sha256(json.dumps(
+        canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    return value, digest
+
+
+def _valid_stored_public_brief(conn: sqlite3.Connection, root: str, checkpoint: str) -> bool:
+    brief = conn.execute(
+        "SELECT * FROM program_decision_public_briefs WHERE root_id=? AND checkpoint_id=?",
+        (root, checkpoint),
+    ).fetchone()
+    raw = conn.execute(
+        "SELECT option_id,ordinal FROM program_decision_options WHERE root_id=? AND checkpoint_id=? ORDER BY ordinal",
+        (root, checkpoint),
+    ).fetchall()
+    decision = conn.execute(
+        "SELECT recommended_option_id,created_at FROM program_decisions WHERE root_id=? AND checkpoint_id=?",
+        (root, checkpoint),
+    ).fetchone()
+    rows = conn.execute(
+        "SELECT * FROM program_decision_public_options WHERE root_id=? AND checkpoint_id=? ORDER BY ordinal",
+        (root, checkpoint),
+    ).fetchall()
+    timestamps_valid = (
+        brief is not None
+        and type(brief["generated_at"]) is int
+        and type(brief["created_at"]) is int
+        and 0 <= brief["generated_at"] <= MAX_SAFE_INTEGER
+            and brief["generated_at"] == brief["created_at"]
+    )
+    if (brief is None or decision is None or brief["schema_version"] != 1
+            or brief["classification"] != "operator_visible" or not timestamps_valid):
+        return False
+    if (len(rows) != len(raw) or not 2 <= len(rows) <= 4
+            or [row["ordinal"] for row in rows] != list(range(len(rows)))
+            or [row["ordinal"] for row in raw] != list(range(len(raw)))
+            or brief["created_at"] != decision["created_at"]):
+        return False
+    try:
+        options = [{
+            "option_id": row["option_id"], "ordinal": row["ordinal"], "label": row["label"],
+            "summary": row["summary"], "benefits": json.loads(row["benefits"]),
+            "risks": json.loads(row["risks"]), "reversibility": row["reversibility"],
+            "security_impact": row["security_impact"], "cost_impact": row["cost_impact"],
+            "operations_impact": row["operations_impact"],
+        } for row in rows]
+        value, digest = _public_brief({
+            "title": brief["title"], "recommendation_rationale": brief["recommendation_rationale"],
+            "recommended_option_id": brief["recommended_option_id"], "options": options,
+        })
+    except (ProgramControlError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    pairs = [(row["option_id"], row["ordinal"]) for row in raw]
+    return ([(item["option_id"], item["ordinal"]) for item in value["options"]] == pairs
+            and value["recommended_option_id"] == decision["recommended_option_id"]
+            and digest == brief["content_digest"])
 
 
 def open_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any]:
@@ -221,6 +400,7 @@ def open_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str
     _exact(request, _OPEN_KEYS); _aggregate(request)
     for field in ("root_id", "checkpoint_id", "node_id", "recommended_option_id", "idempotency_key"):
         request[field] = _string(request[field], field, identifier=True)
+    _public_string(request["checkpoint_id"], maximum=128)
     request["title"] = _string(request["title"], "title", maximum=200)
     request["recommendation_rationale"] = _string(request["recommendation_rationale"], "recommendation_rationale", maximum=1000)
     request["expected_node_version"] = _integer(request["expected_node_version"], "expected_node_version")
@@ -234,6 +414,7 @@ def open_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str
         if not isinstance(option, dict): raise ProgramControlError("invalid_options")
         _exact(option, _OPTION_KEYS)
         option["option_id"] = _string(option["option_id"], "option_id", identifier=True)
+        _public_string(option["option_id"], maximum=128)
         if option["option_id"] in option_ids: raise ProgramControlError("invalid_options")
         option_ids.add(option["option_id"])
         option["label"] = _string(option["label"], "label", maximum=200)
@@ -245,6 +426,12 @@ def open_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str
             raise ProgramControlError("invalid_reversibility")
     if request["recommended_option_id"] not in option_ids:
         raise ProgramControlError("invalid_recommended_option_id")
+    request["public_brief"], public_digest = _public_brief(request["public_brief"])
+    public_ids = [(item["option_id"], item["ordinal"]) for item in request["public_brief"]["options"]]
+    if public_ids != [(item["option_id"], ordinal) for ordinal, item in enumerate(request["options"])]:
+        raise ProgramControlError("public_brief_mismatch")
+    if request["public_brief"]["recommended_option_id"] != request["recommended_option_id"]:
+        raise ProgramControlError("public_brief_mismatch")
 
     def operation(now: int) -> dict[str, Any]:
         rows = _lineage(conn, request["root_id"], [request["node_id"], *request["affected_node_ids"]])
@@ -284,6 +471,17 @@ def open_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str
                           option["label"], option["summary"], json.dumps(option["benefits"], ensure_ascii=False),
                           json.dumps(option["risks"], ensure_ascii=False), option["reversibility"],
                           option["security_impact"], option["cost_impact"], option["operations_impact"]))
+        public = request["public_brief"]
+        conn.execute("INSERT INTO program_decision_public_briefs VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     (request["root_id"], request["checkpoint_id"], 1, "operator_visible",
+                      public["title"], public["recommendation_rationale"],
+                      public["recommended_option_id"], public_digest, now, now))
+        for option in public["options"]:
+            conn.execute("INSERT INTO program_decision_public_options VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (request["root_id"], request["checkpoint_id"], option["option_id"], option["ordinal"],
+                          option["label"], option["summary"], json.dumps(option["benefits"], ensure_ascii=False),
+                          json.dumps(option["risks"], ensure_ascii=False), option["reversibility"],
+                          option["security_impact"], option["cost_impact"], option["operations_impact"]))
         for affected in request["affected_node_ids"]:
             conn.execute("INSERT INTO program_decision_affected_nodes VALUES (?,?,?)",
                          (request["root_id"], request["checkpoint_id"], affected))
@@ -294,7 +492,18 @@ def open_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str
                      (request["node_id"], "decision_checkpoint_opened", json.dumps(payload, separators=(",", ":")), now))
         return {"ok": True, "checkpoint_id": request["checkpoint_id"], "state": "pending",
                 "version": 1, "deduplicated": False}
-    return _mutation(conn, request, "decision_open", "expected_node_version", operation)
+    def validate_replay(result: dict[str, Any]) -> None:
+        row = conn.execute(
+            "SELECT state,version FROM program_decisions WHERE root_id=? AND checkpoint_id=?",
+            (request["root_id"], request["checkpoint_id"]),
+        ).fetchone()
+        if (row is None or not _valid_stored_public_brief(
+                conn, request["root_id"], request["checkpoint_id"])
+                or result.get("checkpoint_id") != request["checkpoint_id"]
+                or result.get("state") != row["state"] or result.get("version") != row["version"]):
+            raise ProgramControlError("public_brief_unavailable")
+    return _mutation(conn, request, "decision_open", "expected_node_version", operation,
+                     validate_replay)
 
 
 def select_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any]:
@@ -302,8 +511,12 @@ def select_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[s
     _exact(request, {"root_id", "checkpoint_id", "option_id", "expected_version", "idempotency_key", "actor"}); _aggregate(request)
     for field in ("root_id", "checkpoint_id", "option_id", "idempotency_key"):
         request[field] = _string(request[field], field, identifier=True)
+    _public_string(request["checkpoint_id"], maximum=128)
+    _public_string(request["option_id"], maximum=128)
     request["expected_version"] = _integer(request["expected_version"], "expected_version")
     request["actor"] = _actor(request["actor"], agent=False)
+    if request["actor"] != "control:owner":
+        raise ProgramControlError("invalid_actor")
     def operation(now: int) -> dict[str, Any]:
         _lineage(conn, request["root_id"], [])
         row = conn.execute("SELECT node_id, version, state FROM program_decisions WHERE root_id=? AND checkpoint_id=?",
@@ -313,6 +526,8 @@ def select_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[s
             raise ProgramControlError("version_conflict")
         if row["version"] == MAX_SAFE_INTEGER:
             raise ProgramControlError("version_exhausted")
+        if not _valid_stored_public_brief(conn, request["root_id"], request["checkpoint_id"]):
+            raise ProgramControlError("invalid_public_brief")
         if conn.execute("SELECT 1 FROM program_decision_options WHERE root_id=? AND checkpoint_id=? AND option_id=?",
                         (request["root_id"], request["checkpoint_id"], request["option_id"])).fetchone() is None:
             raise ProgramControlError("unknown_option")
@@ -334,7 +549,20 @@ def select_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[s
                      (row["node_id"], "decision_checkpoint_selected", json.dumps(payload, separators=(",", ":")), now))
         return {"ok": True, "checkpoint_id": request["checkpoint_id"], "state": "selected",
                 "version": result_version, "selected_option_id": request["option_id"], "deduplicated": False}
-    return _mutation(conn, request, "decision_select", "expected_version", operation)
+    def validate_replay(result: dict[str, Any]) -> None:
+        row = conn.execute(
+            "SELECT state,version,selected_option_id FROM program_decisions "
+            "WHERE root_id=? AND checkpoint_id=?",
+            (request["root_id"], request["checkpoint_id"]),
+        ).fetchone()
+        if (row is None or not _valid_stored_public_brief(
+                conn, request["root_id"], request["checkpoint_id"])
+                or result.get("checkpoint_id") != request["checkpoint_id"]
+                or result.get("state") != row["state"] or result.get("version") != row["version"]
+                or result.get("selected_option_id") != row["selected_option_id"]):
+            raise ProgramControlError("public_brief_unavailable")
+    return _mutation(conn, request, "decision_select", "expected_version", operation,
+                     validate_replay)
 
 
 def add_hint(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any]:

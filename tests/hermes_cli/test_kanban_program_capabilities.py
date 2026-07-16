@@ -13,8 +13,8 @@ from hermes_cli import kanban_db as kb
 
 
 SUCCESS = (
-    '{"contract":"hermes-program-control","board":"alpha","version":1,'
-    '"schema":1,"cli":1,"dispatcher_gate":1,"classic_worker_boundary":1,'
+    '{"contract":"hermes-program-control","board":"alpha","version":2,'
+    '"schema":2,"operator_visible_decision_briefs":1,"cli":1,"dispatcher_gate":1,"classic_worker_boundary":1,'
     '"goal_loop_boundary":1,"ack_writer":1,"events":1}\n'
 )
 
