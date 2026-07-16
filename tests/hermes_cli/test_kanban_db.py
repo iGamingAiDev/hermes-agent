@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import os
 import sqlite3
 import subprocess
@@ -15,6 +16,22 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+class _RecordingConnection:
+    def __init__(self, connection, statements):
+        object.__setattr__(self, "_connection", connection)
+        object.__setattr__(self, "_statements", statements)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._connection, name, value)
+
+    def execute(self, sql, *args, **kwargs):
+        self._statements.append(sql)
+        return self._connection.execute(sql, *args, **kwargs)
 
 
 @pytest.fixture
@@ -3430,6 +3447,236 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
     conn.close()
 
 
+@pytest.mark.parametrize("task_pk", ["TEXT PRIMARY KEY", "INTEGER PRIMARY KEY"])
+def test_direct_migration_creates_canonical_program_control_schema(task_pk):
+    """The legacy helper alone installs the complete canonical A3 schema."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        f"CREATE TABLE tasks (id {task_pk}, title TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'todo', created_at INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "CREATE TABLE task_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+        "run_id INTEGER, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+    )
+
+    kb._migrate_add_optional_columns(conn)
+    kb._migrate_add_optional_columns(conn)
+
+    fresh = sqlite3.connect(":memory:")
+    fresh.row_factory = sqlite3.Row
+    fresh.executescript(kb.SCHEMA_SQL)
+    for table, expected_columns in kb._PROGRAM_CONTROL_COLUMNS.items():
+        assert {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        } == expected_columns
+        assert [tuple(row) for row in conn.execute(f"PRAGMA foreign_key_list({table})")] == [
+            tuple(row) for row in fresh.execute(f"PRAGMA foreign_key_list({table})")
+        ]
+
+    migrated_indexes = {
+        row["name"]: row["sql"]
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+            "AND name LIKE 'idx_program_%'"
+        )
+    }
+    fresh_indexes = {
+        row["name"]: row["sql"]
+        for row in fresh.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+            "AND name LIKE 'idx_program_%'"
+        )
+    }
+    assert migrated_indexes == fresh_indexes
+
+
+def test_direct_migration_rejects_drifted_a3_schema_before_side_effects():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
+    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL)")
+    conn.execute("CREATE TABLE program_hints (root_id TEXT NOT NULL)")
+    before = list(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name"))
+
+    with pytest.raises(RuntimeError, match="program_hints schema"):
+        kb._migrate_add_optional_columns(conn)
+
+    assert list(conn.execute(
+        "SELECT type, name, sql FROM sqlite_master ORDER BY name"
+    )) == before
+
+
+@pytest.mark.parametrize(
+    "version_ddl",
+    [
+        "program_control_version TEXT NOT NULL DEFAULT 0 "
+        "CHECK (program_control_version >= 0 AND program_control_version <= 9007199254740991)",
+        "program_control_version INTEGER DEFAULT 0 "
+        "CHECK (program_control_version >= 0 AND program_control_version <= 9007199254740991)",
+        "program_control_version INTEGER NOT NULL DEFAULT 1 "
+        "CHECK (program_control_version >= 0 AND program_control_version <= 9007199254740991)",
+        "program_control_version INTEGER NOT NULL DEFAULT 0",
+        "program_control_version INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (program_control_version >= 0)",
+        "program_control_version INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (program_control_version >= 0 AND program_control_version < 9007199254740991)",
+    ],
+    ids=["type", "not-null", "default", "missing-check", "lower-only-check", "wrong-upper-check"],
+)
+def test_direct_migration_rejects_program_version_drift_before_a3_side_effects(
+    version_ddl,
+):
+    """An existing version column is validate-only, never repaired in place."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"CREATE TABLE tasks (id TEXT PRIMARY KEY, {version_ddl})")
+    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL)")
+    before = list(conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"))
+
+    with pytest.raises(RuntimeError, match="tasks.program_control_version schema"):
+        kb._migrate_add_optional_columns(conn)
+
+    assert list(conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    )) == before
+
+
+def test_program_control_drift_preflight_does_not_mutate_delete_database(tmp_path):
+    path = tmp_path / "drift-preflight.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("DROP TABLE program_hints")
+    conn.execute("CREATE TABLE program_hints (root_id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO tasks (id,title,status,created_at) VALUES ('kept','Kept','done',1)")
+    conn.commit()
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    conn.close()
+    before = path.read_bytes()
+    wal = path.with_name(path.name + "-wal")
+    shm = path.with_name(path.name + "-shm")
+    assert not wal.exists()
+    assert not shm.exists()
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(RuntimeError, match="program_hints.*schema"):
+        kb.connect(path)
+
+    assert path.read_bytes() == before
+    assert not wal.exists()
+    assert not shm.exists()
+    probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    assert probe.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    assert probe.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()[0] == "Kept"
+    probe.close()
+
+
+def test_program_control_wal_drift_preflight_preserves_original_and_sidecars(tmp_path):
+    path = tmp_path / "drift-wal.db"
+    writer = sqlite3.connect(path)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.executescript(kb.SCHEMA_SQL)
+    writer.commit()
+    writer.execute("DROP TABLE program_hints")
+    writer.execute("CREATE TABLE program_hints (root_id TEXT PRIMARY KEY)")
+    writer.execute("INSERT INTO tasks (id,title,status,created_at) VALUES ('wal-row','WAL','todo',1)")
+    writer.commit()
+
+    paths = [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
+    assert paths[1].exists()
+    before = {
+        item: (item.exists(), item.read_bytes() if item.exists() else None,
+               item.stat().st_mtime_ns if item.exists() else None)
+        for item in paths
+    }
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+    with pytest.raises(RuntimeError, match="program_hints.*schema"):
+        kb.connect(path)
+    after = {
+        item: (item.exists(), item.read_bytes() if item.exists() else None,
+               item.stat().st_mtime_ns if item.exists() else None)
+        for item in paths
+    }
+    assert after == before
+    assert writer.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert writer.execute("SELECT title FROM tasks WHERE id='wal-row'").fetchone()[0] == "WAL"
+    writer.close()
+
+
+@pytest.mark.parametrize("drift_class,table,rewrite", [
+    ("type", "program_decisions", lambda sql: sql.replace(
+        "version INTEGER NOT NULL DEFAULT 1", "version TEXT NOT NULL DEFAULT 1", 1)),
+    ("not-null", "program_decisions", lambda sql: sql.replace(
+        "title TEXT NOT NULL", "title TEXT", 1)),
+    ("default", "program_decisions", lambda sql: sql.replace(
+        "DEFAULT 1", "DEFAULT 2", 1)),
+    ("check", "program_decisions", lambda sql: sql.replace(
+        " AND version <= 9007199254740991", "", 1)),
+    ("foreign-key", "program_decision_affected_nodes", lambda sql: sql.replace(
+        "ON DELETE CASCADE", "ON DELETE RESTRICT", 1)),
+    ("request-root-foreign-key", "program_control_requests", lambda sql: sql.replace(
+        "FOREIGN KEY (root_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE",
+        "FOREIGN KEY (root_id) REFERENCES tasks(id) ON DELETE CASCADE", 1)),
+    ("unique", "program_hints", lambda sql: sql.replace(
+        "UNIQUE (root_id, idempotency_key)", "UNIQUE (root_id, actor)", 1)),
+])
+def test_program_schema_constraint_drift_fails_before_any_mutation(
+    tmp_path, drift_class, table, rewrite
+):
+    path = tmp_path / f"drift-{drift_class}.db"
+    kb.init_db(path)
+    conn = sqlite3.connect(path)
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()[0]
+    changed = rewrite(sql)
+    assert changed != sql
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute("UPDATE sqlite_master SET sql=? WHERE type='table' AND name=?",
+                 (changed, table))
+    conn.execute("PRAGMA writable_schema=OFF")
+    conn.commit()
+    conn.close()
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    probe = sqlite3.connect(path)
+    before = probe.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()
+    probe.close()
+    with pytest.raises(RuntimeError, match=f"{table} schema"):
+        kb.init_db(path)
+    probe = sqlite3.connect(path)
+    assert probe.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall() == before
+    probe.close()
+
+
+def test_program_named_index_drift_fails_before_any_mutation(tmp_path):
+    path = tmp_path / "drift-index.db"
+    kb.init_db(path)
+    conn = sqlite3.connect(path)
+    conn.execute("DROP INDEX idx_program_hints_node_state")
+    conn.commit()
+    before = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()
+    conn.close()
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+    with pytest.raises(RuntimeError, match="schema is incomplete or incompatible"):
+        kb.init_db(path)
+    conn = sqlite3.connect(path)
+    assert conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall() == before
+    conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher spawn invocation — _resolve_hermes_argv()
 #
@@ -4330,6 +4577,115 @@ def test_connect_refuses_corrupt_existing_file(tmp_path):
 
     with pytest.raises(kb.KanbanDbCorruptError):
         kb.connect(db_path=db_path)
+
+
+def test_original_connection_validates_schema_before_integrity_or_pragmas(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    statements = []
+    real_sqlite_connect = kb._sqlite_connect
+
+    def recording_connect(path, *args, **kwargs):
+        connection = real_sqlite_connect(path, *args, **kwargs)
+        if Path(path).resolve() == db_path.resolve():
+            return _RecordingConnection(connection, statements)
+        return connection
+
+    monkeypatch.setattr(kb, "_sqlite_connect", recording_connect)
+    with kb.connect_closing(db_path=db_path):
+        pass
+
+    assert statements[0].startswith("SELECT sql FROM sqlite_master")
+    integrity_index = statements.index("PRAGMA integrity_check")
+    assert integrity_index > 0
+    assert all("busy_timeout" not in sql for sql in statements[:integrity_index])
+
+
+def test_original_schema_drift_stops_before_integrity_and_side_effects(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    statements = []
+    real_sqlite_connect = kb._sqlite_connect
+    real_validate = kb._validate_existing_program_control_schema
+    validation_calls = 0
+
+    def recording_connect(path, *args, **kwargs):
+        connection = real_sqlite_connect(path, *args, **kwargs)
+        if Path(path).resolve() == db_path.resolve():
+            return _RecordingConnection(connection, statements)
+        return connection
+
+    def drift_on_original(connection):
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 2:
+            connection.execute("SELECT 'schema-validation-canary'")
+            raise RuntimeError("schema drift canary")
+        real_validate(connection)
+
+    monkeypatch.setattr(kb, "_sqlite_connect", recording_connect)
+    monkeypatch.setattr(kb, "_validate_existing_program_control_schema", drift_on_original)
+    with pytest.raises(RuntimeError, match="schema drift canary"):
+        kb.connect(db_path=db_path)
+
+    assert statements == ["SELECT 'schema-validation-canary'"]
+    assert list(tmp_path.glob("*.corrupt.*")) == []
+
+
+def test_schema_validation_database_error_backs_up_original(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    original = db_path.read_bytes()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    monkeypatch.setattr(
+        kb,
+        "_validate_existing_program_control_schema",
+        lambda _connection: (_ for _ in ()).throw(sqlite3.DatabaseError("malformed")),
+    )
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.connect(db_path=db_path)
+
+    assert excinfo.value.backup_path is not None
+    assert excinfo.value.backup_path.read_bytes() == original
+
+
+def test_copy_snapshot_retries_without_noatime_for_portable_permission_error(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    source.write_bytes(b"stable snapshot bytes")
+    noatime = 0x40000
+    monkeypatch.setattr(kb.os, "O_NOATIME", noatime, raising=False)
+    real_open = kb.os.open
+    calls = []
+
+    def noatime_denied(path, flags, *args, **kwargs):
+        calls.append(flags)
+        if flags & noatime:
+            raise OSError(errno.EPERM, "no O_NOATIME permission")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(kb.os, "open", noatime_denied)
+    kb._copy_snapshot_file(source, target)
+
+    assert calls == [kb.os.O_RDONLY | noatime, kb.os.O_RDONLY]
+    assert target.read_bytes() == source.read_bytes()
+
+
+def test_normal_startup_with_snapshot_copy(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect_closing(db_path=db_path) as conn:
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
 
 
 def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
