@@ -540,6 +540,21 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "kanban.db"
 
 
+def capability_db_path(board: str) -> Path:
+    """Return the canonical DB path for an explicit capability board.
+
+    Capability negotiation is a statement about the board named on the wire,
+    so it must not inherit worker/current-board routing or the legacy direct DB
+    override used by normal runtime connections.
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        raise ValueError("board slug is required")
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
@@ -1589,6 +1604,7 @@ _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 
 # Bounded acquire for the cross-process init lock (#36644). The original bare
 # blocking flock had no timeout, so a wedged holder blocked the dispatcher's
@@ -2056,6 +2072,175 @@ def _stable_db_snapshot(path: Path, *, attempts: int = 3):
                 yield target_dir / source.name
                 return
         raise RuntimeError("kanban database changed during snapshot preflight")
+
+
+class _CapabilitySnapshotRace(RuntimeError):
+    """A benign source-content race which may be retried from fresh fds."""
+
+
+def _fd_signature(fd: int) -> tuple[int, ...]:
+    stat = os.fstat(fd)
+    return (
+        stat.st_dev, stat.st_ino, stat.st_mode, stat.st_uid, stat.st_gid,
+        stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+    )
+
+
+def _capability_open_chain(path: Path) -> tuple[list[int], list[tuple[int, ...]]]:
+    """Pin every directory from the filesystem root through ``path``."""
+    opath = getattr(os, "O_PATH", None)
+    noatime = getattr(os, "O_NOATIME", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if (
+        opath is None
+        or noatime is None
+        or nofollow is None
+        or directory is None
+        or not _OPEN_SUPPORTS_DIR_FD
+    ):
+        raise RuntimeError("safe descriptor-relative filesystem access unavailable")
+    flags = opath | directory | nofollow | noatime
+    fds = [os.open(path.anchor, flags)]
+    signatures = [_fd_signature(fds[0])]
+    try:
+        for part in path.parts[1:]:
+            fd = os.open(part, flags, dir_fd=fds[-1])
+            fds.append(fd)
+            signatures.append(_fd_signature(fd))
+        return fds, signatures
+    except BaseException:
+        for fd in reversed(fds):
+            os.close(fd)
+        raise
+
+
+def _capability_verify_chain(path: Path, signatures: list[tuple[int, ...]]) -> None:
+    fds, current = _capability_open_chain(path)
+    try:
+        if current != signatures:
+            raise RuntimeError("database ancestor chain changed")
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def _copy_capability_fd(source_fd: int, target: Path) -> None:
+    with os.fdopen(os.dup(source_fd), "rb") as source_handle:
+        with target.open("wb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, 1024 * 1024)
+
+
+def _capability_snapshot_attempt(path: Path, target_dir: Path) -> Path:
+    noatime = getattr(os, "O_NOATIME", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if noatime is None or nofollow is None or not _OPEN_SUPPORTS_DIR_FD:
+        raise RuntimeError("safe no-atime filesystem access unavailable")
+
+    parent = path.parent
+    chain_fds, chain_signatures = _capability_open_chain(parent)
+    parent_fd = chain_fds[-1]
+    opened: dict[str, tuple[int, tuple[int, ...]]] = {}
+    flags = os.O_RDONLY | noatime | nofollow
+    names = (path.name, path.name + "-wal", path.name + "-shm")
+    try:
+        for index, name in enumerate(names):
+            try:
+                fd = os.open(name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if index == 0:
+                    raise
+                continue
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise RuntimeError("database source must not be a symlink") from exc
+                raise
+            opened[name] = (fd, _fd_signature(fd))
+
+        for name, (fd, before) in opened.items():
+            _copy_capability_fd(fd, target_dir / name)
+            if _fd_signature(fd) != before:
+                raise _CapabilitySnapshotRace("database content changed during copy")
+
+        for name in names:
+            prior = opened.get(name)
+            try:
+                verify_fd = os.open(name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if prior is not None:
+                    raise _CapabilitySnapshotRace("database sidecar disappeared")
+                continue
+            try:
+                if prior is None:
+                    raise _CapabilitySnapshotRace("database sidecar appeared")
+                if _fd_signature(verify_fd) != prior[1]:
+                    raise _CapabilitySnapshotRace("database source was replaced")
+            finally:
+                os.close(verify_fd)
+        _capability_verify_chain(parent, chain_signatures)
+        return target_dir / path.name
+    finally:
+        for fd, _signature in opened.values():
+            os.close(fd)
+        for fd in reversed(chain_fds):
+            os.close(fd)
+
+
+@contextlib.contextmanager
+def _strict_capability_db_snapshot(path: Path, *, attempts: int = 3):
+    """Yield an atime-safe snapshot pinned entirely by directory descriptors."""
+    lexical = path.absolute()
+    with tempfile.TemporaryDirectory(prefix="hermes-kanban-capability-") as temp_dir:
+        target_dir = Path(temp_dir)
+        for attempt in range(attempts):
+            for old in target_dir.iterdir():
+                old.unlink()
+            try:
+                snapshot = _capability_snapshot_attempt(lexical, target_dir)
+            except _CapabilitySnapshotRace:
+                if attempt + 1 < attempts:
+                    continue
+                raise
+            yield snapshot
+            return
+
+
+def validate_current_program_control_schema_read_only(path: Path) -> None:
+    """Validate the complete current A3 contract without opening its source.
+
+    SQLite may write an SHM file even for a read-only WAL connection, so every
+    SQLite operation is deliberately confined to the private stable snapshot.
+    This is a capability check, not migration preflight: predecessors and
+    partially-installed schemas are rejected rather than repaired.
+    """
+    lexical = path.absolute()
+    with _strict_capability_db_snapshot(lexical) as snapshot:
+        _validate_sqlite_header(snapshot)
+        if not snapshot.exists() or snapshot.stat().st_size == 0:
+            raise RuntimeError("database is missing")
+        _guard_existing_db_is_healthy(snapshot)
+        connection = sqlite3.connect(f"{snapshot.as_uri()}?mode=ro", uri=True)
+        try:
+            connection.row_factory = sqlite3.Row
+            tasks = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
+            ).fetchone()
+            if tasks is None:
+                raise RuntimeError("tasks schema is missing")
+            version_column = next(
+                (row for row in connection.execute("PRAGMA table_xinfo(tasks)")
+                 if row["name"] == "program_control_version"),
+                None,
+            )
+            if version_column is None:
+                raise RuntimeError("tasks program-control version is missing")
+            _validate_existing_program_control_version(connection)
+            _validate_program_control_schema(connection)
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RuntimeError("program-control foreign keys are invalid")
+        finally:
+            connection.close()
+
 
 
 def connect(

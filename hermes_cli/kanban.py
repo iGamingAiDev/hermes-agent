@@ -193,6 +193,17 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
 
 _INVALID_REQUEST_JSON = '{"error":"invalid_request","ok":false}'
 
+_PROGRAM_CAPABILITIES = (
+    ("version", 1),
+    ("schema", 1),
+    ("cli", 1),
+    ("dispatcher_gate", 1),
+    ("classic_worker_boundary", 1),
+    ("goal_loop_boundary", 1),
+    ("ack_writer", 1),
+    ("events", 1),
+)
+
 
 class _ProgramMutationParser(argparse.ArgumentParser):
     """Argparse boundary whose failures are safe for machine consumers."""
@@ -409,6 +420,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_program_create.add_argument("--project", default=None)
     p_program_create.add_argument("--idempotency-key", default=None)
     p_program_create.add_argument("--json", action="store_true")
+
+    program_sub._parser_class = _ProgramMutationLeafParser
+    p_program_capabilities = program_sub.add_parser(
+        "capabilities",
+        help="Report the machine program-control contract",
+    )
+    p_program_capabilities.add_argument("--json", action="store_true", required=True)
 
     # Program creation keeps the ordinary human-facing argparse contract.
     # Only the mutation branches below use the machine-only error boundary.
@@ -962,6 +980,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     # (rather than threading `board=` through 50+ kb.connect() sites)
     # keeps the patch small and inherits the exact same resolution the
     # dispatcher uses for workers — consistency is a feature here.
+    is_program_capabilities = (
+        action == "program" and getattr(args, "program_action", None) == "capabilities"
+    )
     is_program_mutation = action == "program" and (
         (
             getattr(args, "program_action", None) == "decision"
@@ -974,25 +995,31 @@ def kanban_command(args: argparse.Namespace) -> int:
     )
     board_override = getattr(args, "board", None)
     board_scope = contextlib.nullcontext()
+    if is_program_capabilities and board_override is None:
+        print(_INVALID_REQUEST_JSON, file=sys.stderr)
+        return 2
     if board_override is not None:
         try:
             normed = kb._normalize_board_slug(board_override)
         except ValueError as exc:
-            if is_program_mutation:
+            if is_program_mutation or is_program_capabilities:
                 print(_INVALID_REQUEST_JSON, file=sys.stderr)
                 return 2
             print(f"kanban: {exc}", file=sys.stderr)
             return 2
         if not normed:
-            if is_program_mutation:
+            if is_program_mutation or is_program_capabilities:
                 print(_INVALID_REQUEST_JSON, file=sys.stderr)
                 return 2
             print("kanban: --board requires a slug", file=sys.stderr)
             return 2
         # Boards other than 'default' must already exist — typoed slugs
         # would otherwise silently create an empty board.
+        if is_program_capabilities and not kb.capability_db_path(normed).is_file():
+            print('{"error":"unknown_board","ok":false}', file=sys.stderr)
+            return 2
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
-            if is_program_mutation:
+            if is_program_mutation or is_program_capabilities:
                 print('{"error":"unknown_board","ok":false}', file=sys.stderr)
                 return 2
             print(
@@ -1002,6 +1029,11 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
             return 1
         board_scope = kb.scoped_current_board(normed)
+        if is_program_capabilities:
+            args._normalized_board = normed
+
+    if is_program_capabilities:
+        return _cmd_program_capabilities(args)
 
     # Auto-initialize the DB before dispatching any subcommand. init_db
     # is idempotent, so running it every invocation is cheap (one
@@ -1515,6 +1547,31 @@ def _cmd_program(args: argparse.Namespace) -> int:
                          separators=(",", ":")), file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def _cmd_program_capabilities(args: argparse.Namespace) -> int:
+    try:
+        board = args._normalized_board
+        kb.validate_current_program_control_schema_read_only(
+            kb.capability_db_path(board)
+        )
+        constants = _PROGRAM_CAPABILITIES
+        if (
+            not isinstance(constants, tuple)
+            or tuple(name for name, _value in constants) != (
+                "version", "schema", "cli", "dispatcher_gate",
+                "classic_worker_boundary", "goal_loop_boundary", "ack_writer", "events",
+            )
+            or any(type(value) is not int or value != 1 for _name, value in constants)
+        ):
+            raise RuntimeError("incomplete capability contract")
+        result = {"contract": "hermes-program-control", "board": board}
+        result.update(constants)
+    except Exception:
+        print('{"error":"database_error","ok":false}', file=sys.stderr)
+        return 1
+    print(json.dumps(result, separators=(",", ":")))
     return 0
 
 
@@ -2941,11 +2998,19 @@ def run_slash(rest: str) -> str:
     # reject before argparse dispatch so no future handler refactor can expose
     # this mutation surface outside trusted direct OS argv.
     command_tokens = [token for token in tokens if not token.startswith("--board=")]
-    if (command_tokens and command_tokens[0] == "program") or (
+    is_capabilities = (
+        command_tokens == ["program", "capabilities", "--json"]
+        or (
+            len(command_tokens) == 5
+            and command_tokens[0] == "--board"
+            and command_tokens[2:] == ["program", "capabilities", "--json"]
+        )
+    )
+    if not is_capabilities and ((command_tokens and command_tokens[0] == "program") or (
         len(command_tokens) >= 4
         and command_tokens[0] == "--board"
         and command_tokens[2] == "program"
-    ):
+    )):
         return (
             "⚠ /kanban program mutations are restricted to the trusted direct "
             "OS argv CLI"
