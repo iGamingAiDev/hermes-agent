@@ -224,6 +224,403 @@ def test_loop_continues_then_worker_completes(monkeypatch):
     assert all("not done yet" in p for p in turns)
 
 
+def test_loop_merges_hints_into_existing_turn_without_extra_turn(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"])
+    statuses = iter(["running", "done"])
+    turns = []
+    batches = [[{"hint_id": "h1", "text": "private"}]]
+    acked = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="hinted",
+        goal_text="ship feature",
+        run_turn=lambda p: turns.append(p) or "done",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail(r),
+        max_turns=2,
+        first_response="started",
+        prepare_turn=lambda p: (p + "\n\nPRIVATE", batches.pop(0)),
+        ack_turn=lambda batch: acked.extend(batch),
+    )
+    assert res["turns_used"] == 2
+    assert len(turns) == 1  # hint did not create a separate turn
+    assert turns[0].endswith("\n\nPRIVATE")
+    assert [item["hint_id"] for item in acked] == ["h1"]
+
+
+def test_goal_loop_never_sends_hinted_model_prose_to_judge_emit_or_log(monkeypatch):
+    canary = "SECRET-CANARY"
+    judged = []
+    emitted = []
+    logged = []
+    statuses = iter(["running", "done"])
+
+    def judge(_goal, response, **_kwargs):
+        judged.append(response)
+        return "continue", "fixed", False, None
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    result = goals.run_kanban_goal_loop(
+        task_id="hint-private",
+        goal_text="ship",
+        run_turn=lambda _prompt: canary,
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda reason: pytest.fail(reason),
+        first_response="public first",
+        prepare_turn=lambda prompt: (prompt + "\nprivate", [{"hint_id": "h1", "text": "a"}]),
+        ack_turn=lambda _batch: None,
+        emit_turn=emitted.append,
+        log=logged.append,
+    )
+    assert result["outcome"] == "completed_by_worker"
+    assert judged == ["public first"]
+    assert emitted == ["Operator-guided model turn completed."]
+    assert canary not in repr((result, judged, emitted, logged))
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_reason"),
+    [
+        ({"response": "SECRET", "failed": True}, None),
+        ({"response": "SECRET", "partial": True}, None),
+        ({"response": "SECRET", "failed": True, "failure_reason": "rate_limit"}, "rate_limit"),
+        ({"response": "SECRET", "partial": True, "failure_reason": "billing"}, "billing"),
+    ],
+)
+def test_hinted_goal_turn_failure_is_fixed_unacked_unjudged_and_counted(
+    monkeypatch, raw, expected_reason
+):
+    judged = []
+    emitted = []
+    logged = []
+    acked = []
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda _goal, response, **_kwargs: judged.append(response)
+        or ("continue", "fixed", False, None),
+    )
+
+    result = goals.run_kanban_goal_loop(
+        task_id="hint-failure",
+        goal_text="ship",
+        run_turn=lambda _prompt: goals.KanbanGoalTurnResult(**raw),
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason: pytest.fail(reason),
+        max_turns=5,
+        first_response="public first",
+        prepare_turn=lambda prompt: (prompt + "\nprivate", [{"hint_id": "h1", "text": "secret"}]),
+        ack_turn=lambda batch: acked.extend(batch),
+        emit_turn=emitted.append,
+        log=logged.append,
+    )
+
+    assert result["outcome"] == "turn_failed"
+    assert result["turns_used"] == 2
+    assert result["result"]["final_response"] == "Operator-guided model turn failed."
+    assert result["result"].get("failure_reason") == expected_reason
+    assert raw.get("failed") is result["result"].get("failed")
+    assert raw.get("partial") is result["result"].get("partial")
+    assert acked == [] and emitted == []
+    assert judged == ["public first"]
+    assert "SECRET" not in repr((result, judged, emitted, logged))
+
+
+def test_goal_turn_exception_is_fixed_unacked_and_counted(monkeypatch):
+    judged = []
+    acked = []
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda _goal, response, **_kwargs: judged.append(response)
+        or ("continue", "fixed", False, None),
+    )
+
+    def explode(_prompt):
+        raise RuntimeError("SECRET provider prose")
+
+    result = goals.run_kanban_goal_loop(
+        task_id="exception",
+        goal_text="ship",
+        run_turn=explode,
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason: pytest.fail(reason),
+        first_response="public first",
+        prepare_turn=lambda prompt: (prompt, [{"hint_id": "h1", "text": "secret"}]),
+        ack_turn=lambda batch: acked.extend(batch),
+    )
+    assert result == {
+        "outcome": "turn_failed",
+        "turns_used": 2,
+        "result": {
+            "final_response": "Operator-guided model turn failed.",
+            "error": {
+                "code": "operator_guided_turn_failed",
+                "message": "The operator-guided model turn failed.",
+            },
+            "failed": True,
+        },
+    }
+    assert judged == ["public first"]
+    assert acked == []
+    assert "SECRET" not in repr(result)
+
+
+def test_no_hint_goal_turn_success_and_judging_are_unchanged(monkeypatch):
+    judged = []
+    statuses = iter(["running", "done"])
+    exact = "exact response bytes\n"
+    monkeypatch.setattr(
+        goals,
+        "judge_goal",
+        lambda _goal, response, **_kwargs: judged.append(response)
+        or ("continue", "fixed", False, None),
+    )
+    result = goals.run_kanban_goal_loop(
+        task_id="plain",
+        goal_text="ship",
+        run_turn=lambda _prompt: exact,
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda reason: pytest.fail(reason),
+        first_response="first",
+    )
+    assert result["outcome"] == "completed_by_worker"
+    assert judged == ["first"]
+
+
+def test_no_hint_failed_goal_turn_is_fixed_and_stops_without_extra_turn(monkeypatch):
+    calls = []
+    _patch_judge(monkeypatch, ["continue"] * 3)
+    result = goals.run_kanban_goal_loop(
+        task_id="plain-failure",
+        goal_text="ship",
+        run_turn=lambda prompt: calls.append(prompt) or goals.KanbanGoalTurnResult(
+            response="SECRET", failed=True, failure_reason=None
+        ),
+        task_status_fn=lambda: "running",
+        block_fn=lambda reason: pytest.fail(reason),
+        max_turns=5,
+        first_response="first",
+    )
+    assert len(calls) == 1
+    assert result["outcome"] == "turn_failed"
+    assert result["turns_used"] == 2
+    assert result["result"]["failed"] is True
+    assert "SECRET" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    ("later", "expected_exit"),
+    [
+        ({"failed": True}, 1),
+        ({"partial": True}, 1),
+        ({"failed": True, "failure_reason": "rate_limit"}, 75),
+        ({"partial": True, "failure_reason": "billing"}, 75),
+    ],
+)
+def test_main_goal_outcome_replaces_initial_success_and_controls_exit(monkeypatch, later, expected_exit):
+    from cli import _apply_goal_loop_outcome, _kanban_worker_exit_code
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task")
+    fixed = goals._fixed_goal_turn_failure(goals.KanbanGoalTurnResult(**later))
+    result, response = _apply_goal_loop_outcome(
+        {"final_response": "initial success"},
+        "initial success",
+        {"outcome": "turn_failed", "turns_used": 2, "result": fixed},
+    )
+    assert result is fixed
+    assert response == "Operator-guided model turn failed."
+    assert _kanban_worker_exit_code(result) == expected_exit
+    assert "initial success" not in repr((result, response))
+
+
+def test_apply_goal_loop_outcome_accepts_any_typed_failure_outcome():
+    from cli import _apply_goal_loop_outcome
+
+    fixed = goals._fixed_goal_turn_failure()
+    result, response = _apply_goal_loop_outcome(
+        {"final_response": "initial success"},
+        "initial success",
+        {"outcome": "operational_failed", "turns_used": 1, "result": fixed},
+    )
+    assert result is fixed
+    assert response == "Operator-guided model turn failed."
+
+
+def test_quiet_goal_output_is_buffered_until_success_and_keeps_exact_order():
+    from cli import _publish_goal_loop_output
+
+    emitted = []
+    result, response = _publish_goal_loop_output(
+        {"final_response": "initial\nbytes"},
+        "initial\nbytes",
+        {"outcome": "completed_by_worker", "turns_used": 3},
+        ["continuation one\n", "continuation two"],
+        emit=emitted.append,
+    )
+    assert (result, response) == ({"final_response": "initial\nbytes"}, "initial\nbytes")
+    assert emitted == ["initial\nbytes", "continuation one\n", "continuation two"]
+
+
+@pytest.mark.parametrize(
+    "later",
+    [
+        {"failed": True},
+        {"partial": True},
+        {"failed": True, "failure_reason": "rate_limit"},
+    ],
+)
+def test_quiet_goal_output_discards_initial_and_buffered_success_on_failure(later):
+    from cli import _kanban_worker_exit_code, _publish_goal_loop_output
+
+    fixed = goals._fixed_goal_turn_failure(goals.KanbanGoalTurnResult(**later))
+    emitted = []
+    result, response = _publish_goal_loop_output(
+        {"final_response": "INITIAL SUCCESS CANARY"},
+        "INITIAL SUCCESS CANARY",
+        {"outcome": "operational_failed", "turns_used": 2, "result": fixed},
+        ["BUFFERED HINTED SUCCESS CANARY"],
+        emit=emitted.append,
+    )
+    assert result is fixed
+    assert response == "Operator-guided model turn failed."
+    assert emitted == ["Operator-guided model turn failed."]
+    assert "SUCCESS CANARY" not in repr(emitted)
+    assert _kanban_worker_exit_code(result) in (1, 75)
+
+
+def test_loop_task_status_exception_is_fixed_operational_failure(monkeypatch):
+    from cli import _kanban_worker_exit_code
+
+    def explode():
+        raise RuntimeError("SECRET status path")
+
+    result = goals.run_kanban_goal_loop(
+        task_id="status-exception", goal_text="ship", run_turn=lambda _: "unused",
+        task_status_fn=explode, block_fn=lambda _: None, first_response="success",
+    )
+    assert result["outcome"] == "operational_failed"
+    assert result["result"] == goals._fixed_goal_turn_failure()
+    assert _kanban_worker_exit_code(result["result"]) == 1
+    assert "SECRET" not in repr(result)
+
+
+@pytest.mark.parametrize("verdicts,max_turns", [(["done", "done"], 10), (["continue"], 1)])
+def test_loop_block_exception_is_fixed_operational_failure(monkeypatch, verdicts, max_turns):
+    from cli import _kanban_worker_exit_code
+
+    _patch_judge(monkeypatch, verdicts)
+
+    def explode(_reason):
+        raise RuntimeError("SECRET persistence path")
+
+    result = goals.run_kanban_goal_loop(
+        task_id="block-exception", goal_text="ship", run_turn=lambda _: "continued",
+        task_status_fn=lambda: "running", block_fn=explode,
+        max_turns=max_turns, first_response="success",
+    )
+    assert result["outcome"] == "operational_failed"
+    assert result["result"] == goals._fixed_goal_turn_failure()
+    assert _kanban_worker_exit_code(result["result"]) == 1
+    assert "SECRET" not in repr(result)
+
+
+def test_loop_judge_exception_is_fixed_operational_failure(monkeypatch):
+    from cli import _kanban_worker_exit_code
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("SECRET judge path")
+
+    monkeypatch.setattr(goals, "judge_goal", explode)
+    result = goals.run_kanban_goal_loop(
+        task_id="judge-exception", goal_text="ship", run_turn=lambda _: "unused",
+        task_status_fn=lambda: "running", block_fn=lambda _: None,
+        first_response="success",
+    )
+    assert result["outcome"] == "operational_failed"
+    assert result["result"] == goals._fixed_goal_turn_failure()
+    assert _kanban_worker_exit_code(result["result"]) == 1
+    assert "SECRET" not in repr(result)
+
+
+def test_loop_judge_parse_failure_is_fixed_operational_failure(monkeypatch):
+    monkeypatch.setattr(
+        goals, "judge_goal", lambda *_a, **_kw: ("continue", "PRIVATE PARSE", True, None)
+    )
+    result = goals.run_kanban_goal_loop(
+        task_id="parse", goal_text="ship", run_turn=lambda _: pytest.fail("no turn"),
+        task_status_fn=lambda: "running", block_fn=lambda _: pytest.fail("no block"),
+        first_response="success",
+    )
+    assert result["outcome"] == "operational_failed"
+    assert result["result"] == goals._fixed_goal_turn_failure()
+    assert "PRIVATE" not in repr(result)
+
+
+@pytest.mark.parametrize("status", ["ready", "archived", "cancelled", "unexpected"])
+def test_loop_unexpected_or_reclaimed_status_is_operational_failure(status):
+    result = goals.run_kanban_goal_loop(
+        task_id="stale", goal_text="ship", run_turn=lambda _: pytest.fail("no turn"),
+        task_status_fn=lambda: status, block_fn=lambda _: pytest.fail("no block"),
+        first_response="initial success",
+    )
+    assert result["outcome"] == "operational_failed"
+    assert result["result"] == goals._fixed_goal_turn_failure()
+
+
+def test_quiet_goal_setup_missing_task_id_is_typed_operational_failure(monkeypatch):
+    from cli import _run_kanban_goal_loop_q
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    result = _run_kanban_goal_loop_q(object(), "initial success")
+    assert result["outcome"] == "operational_failed"
+    assert result["result"] == goals._fixed_goal_turn_failure()
+
+
+@pytest.mark.parametrize("setup", ["missing_task", "empty_goal"])
+def test_quiet_goal_setup_invalid_card_is_typed_operational_failure(tmp_path, monkeypatch, setup):
+    from cli import _run_kanban_goal_loop_q
+    from hermes_cli import kanban_db as kb
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        if setup == "missing_task":
+            task_id = "t_missing"
+        else:
+            task_id = kb.create_task(conn, title="temporary")
+            conn.execute("UPDATE tasks SET title='',body='' WHERE id=?", (task_id,))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    result = _run_kanban_goal_loop_q(object(), "initial success")
+    assert result["outcome"] == "operational_failed"
+    assert result["result"] == goals._fixed_goal_turn_failure()
+
+
+@pytest.mark.parametrize("raw,reason,exit_code", [
+    ({"failed": True, "final_response": "PRIVATE", "error": "provider"}, None, 1),
+    ({"partial": True, "final_response": "PRIVATE", "provider": "x"}, None, 1),
+    ({"failed": True, "failure_reason": "rate_limit", "final_response": "PRIVATE"}, "rate_limit", 75),
+    ({"partial": True, "failure_reason": "billing", "final_response": "PRIVATE"}, "billing", 75),
+])
+def test_initial_goal_failure_without_hints_is_fixed(monkeypatch, raw, reason, exit_code):
+    from cli import _kanban_worker_exit_code, _run_kanban_worker_turns
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task")
+    class Agent:
+        def run_conversation(self, **_kwargs):
+            return raw
+    class CLI:
+        agent = Agent()
+        conversation_history = []
+    class Boundary:
+        def prepare(self, prompt):
+            return prompt, []
+        def ack(self, _batch):
+            pytest.fail("empty batch must not ack")
+    result, response = _run_kanban_worker_turns(CLI(), "prompt", boundary=Boundary(), goal_mode=True)
+    assert response == "Operator-guided model turn failed."
+    assert result.get("failure_reason") == reason
+    assert "PRIVATE" not in repr(result)
+    assert _kanban_worker_exit_code(result) == exit_code
+
+
 def test_loop_blocks_on_budget_exhaustion(monkeypatch):
     _patch_judge(monkeypatch, ["continue"] * 10)
     blocked = {}
@@ -295,4 +692,4 @@ def test_loop_stops_if_task_reclaimed(monkeypatch):
         block_fn=lambda r: pytest.fail("should not block"),
         first_response="x",
     )
-    assert res["outcome"] == "stopped"
+    assert res["outcome"] == "operational_failed"

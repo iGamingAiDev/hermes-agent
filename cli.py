@@ -15841,21 +15841,120 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+_CLASSIC_HINT_CONTINUATION = (
+    "Incorporate the following advisory operator context into the work already completed, "
+    "without discarding completed work. Preserve the task contract and all existing authority "
+    "and safety constraints."
+)
+
+
+def _turn_failed(result: Any) -> bool:
+    return bool(isinstance(result, dict) and (result.get("failed") or result.get("partial")))
+
+
+def _fixed_kanban_failure(value: Any = None) -> dict[str, Any]:
+    """Close a quiet kanban failure to the Phase3B public allowlist."""
+    from hermes_cli.kanban_hint_delivery import sanitize_hinted_turn_result
+    if not isinstance(value, dict) or not _turn_failed(value):
+        value = {"failed": True}
+    return sanitize_hinted_turn_result(value, ({"text": "private"},))
+
+
+def _combine_classic_continuation(initial: Any, initial_response: str) -> tuple[Any, str]:
+    """Publish one fixed continuation line while preserving initial control fields."""
+    from hermes_cli.kanban_hint_delivery import HINTED_TURN_SUCCESS
+    combined = f"{initial_response}\n{HINTED_TURN_SUCCESS}"
+    if isinstance(initial, dict):
+        return {**initial, "final_response": combined}, combined
+    return {"final_response": combined}, combined
+
+
+def _run_kanban_worker_turns(cli: "HermesCLI", user_message: Any, *, boundary=None,
+                              goal_mode: bool = False) -> tuple[Any, str]:
+    """Run the initial worker turn and the classic worker's sole post-turn boundary."""
+    batch = []
+    try:
+        if boundary is not None:
+            user_message, batch = boundary.prepare(user_message)
+        result = cli.agent.run_conversation(
+            user_message=user_message, conversation_history=cli.conversation_history,
+        )
+    except Exception:
+        if boundary is not None:
+            result = _fixed_kanban_failure()
+            return result, result["final_response"]
+        raise
+    if batch:
+        from hermes_cli.kanban_hint_delivery import sanitize_hinted_turn_result
+        result = sanitize_hinted_turn_result(result, batch)
+    response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+    if _turn_failed(result):
+        if boundary is not None and goal_mode:
+            result = _fixed_kanban_failure(result)
+            response = result["final_response"]
+        return result, response
+    try:
+        if batch:
+            boundary.ack(batch)
+    except Exception:
+        result = _fixed_kanban_failure()
+        return result, result["final_response"]
+    if boundary is None or goal_mode:
+        return result, response
+    try:
+        continuation_prompt, continuation_batch = boundary.prepare(_CLASSIC_HINT_CONTINUATION)
+    except Exception:
+        failed_result = _fixed_kanban_failure()
+        return failed_result, failed_result["final_response"]
+    if not continuation_batch:
+        return result, response
+    try:
+        continuation_result = cli.agent.run_conversation(
+            user_message=continuation_prompt, conversation_history=cli.conversation_history,
+        )
+    except Exception:
+        failed_result = _fixed_kanban_failure()
+        return failed_result, failed_result["final_response"]
+    from hermes_cli.kanban_hint_delivery import sanitize_hinted_turn_result
+    continuation_result = sanitize_hinted_turn_result(continuation_result, continuation_batch)
+    if _turn_failed(continuation_result):
+        return continuation_result, continuation_result["final_response"]
+    try:
+        boundary.ack(continuation_batch)
+    except Exception:
+        failed_result = _fixed_kanban_failure()
+        return failed_result, failed_result["final_response"]
+    return _combine_classic_continuation(result, response)
+
+
+def _hint_boundary_from_worker_env():
+    """Build attempt authority only from dispatcher and active-profile state."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return None
+    run_text = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    if not run_text or not claim_lock:
+        raise ValueError("incomplete kanban worker authority")
+    from hermes_cli.kanban_hint_delivery import HintBoundary
+    from hermes_cli.profiles import get_active_profile_name
+    return HintBoundary(task_id, int(run_text), claim_lock, get_active_profile_name())
+
+
+def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, emit_turn=None):
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
     only when ``HERMES_KANBAN_GOAL_MODE`` is set (dispatcher-spawned
-    goal_mode card). Wires the worker's ``run_conversation`` and the kanban
-    DB into ``goals.run_kanban_goal_loop``. All errors are swallowed by the
-    caller — a broken goal loop must never wedge a worker, the dispatcher's
-    claim TTL / crash detection is the backstop.
+    goal_mode card). Returns the loop's narrow public outcome so a later
+    provider failure controls the worker process exit.
     """
     import os as _os
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
-        return
+        return {"outcome": "operational_failed", "turns_used": 1,
+                "result": _fixed_kanban_failure()}
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -15871,19 +15970,23 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         except Exception:
             pass
     if task is None:
-        return
+        return {"outcome": "operational_failed", "turns_used": 1,
+                "result": _fixed_kanban_failure()}
 
     goal_parts = [task.title or ""]
     if task.body:
         goal_parts.append(task.body)
     goal_text = "\n\n".join(p for p in goal_parts if p).strip()
     if not goal_text:
-        return
+        return {"outcome": "operational_failed", "turns_used": 1,
+                "result": _fixed_kanban_failure()}
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
-    def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
+    from hermes_cli.goals import KanbanGoalTurnResult
+
+    def _run_turn(prompt: str) -> KanbanGoalTurnResult:
+        raw = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
         )
@@ -15893,10 +15996,22 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             and cli.agent.session_id != cli.session_id
         ):
             cli.session_id = cli.agent.session_id
-        resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
-        if resp:
-            print(resp)
-        return resp or ""
+        if type(raw) is dict:
+            failed = raw.get("failed") is True
+            partial = raw.get("partial") is True
+            failure_reason = raw.get("failure_reason")
+            if failure_reason not in ("rate_limit", "billing"):
+                failure_reason = None
+            response = raw.get("final_response", "")
+            if not isinstance(response, str):
+                response = ""
+            return KanbanGoalTurnResult(
+                response=response,
+                failed=failed,
+                partial=partial,
+                failure_reason=failure_reason,
+            )
+        return KanbanGoalTurnResult(response=raw if isinstance(raw, str) else str(raw or ""))
 
     def _task_status() -> "str | None":
         c = _kb.connect()
@@ -15919,7 +16034,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    _run_loop(
+    boundary = _hint_boundary_from_worker_env()
+    return _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
@@ -15928,7 +16044,57 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
+        prepare_turn=boundary.prepare if boundary is not None else None,
+        ack_turn=boundary.ack if boundary is not None else None,
+        emit_turn=print if emit_turn is None else emit_turn,
     )
+
+
+def _apply_goal_loop_outcome(result: Any, response: str, outcome: Any) -> tuple[Any, str]:
+    """Replace initial success only with a later loop's fixed failure result."""
+    if isinstance(outcome, dict):
+        fixed = outcome.get("result")
+        if isinstance(fixed, dict) and _turn_failed(fixed):
+            return fixed, fixed.get("final_response", "")
+    return result, response
+
+
+def _publish_goal_loop_output(
+    result: Any,
+    response: str,
+    outcome: Any,
+    buffered_turns: list[str],
+    *,
+    emit=print,
+) -> tuple[Any, str]:
+    """Apply the private loop outcome before releasing any successful prose."""
+    result, response = _apply_goal_loop_outcome(result, response, outcome)
+    if _turn_failed(result):
+        if response:
+            emit(response)
+        return result, response
+    if response:
+        emit(response)
+    for turn_response in buffered_turns:
+        emit(turn_response)
+    return result, response
+
+
+def _kanban_worker_exit_code(result: Any) -> int:
+    """Map the closed worker result contract to its process exit code."""
+    if not _turn_failed(result):
+        return 0
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and isinstance(result, dict)
+        and result.get("failure_reason") in ("rate_limit", "billing")
+    ):
+        try:
+            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+            return KANBAN_RATE_LIMIT_EXIT_CODE
+        except Exception:
+            pass
+    return 1
 
 
 def main(
@@ -16336,28 +16502,38 @@ def main(
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
                         try:
-                            result = cli.agent.run_conversation(
-                                user_message=effective_query,
-                                conversation_history=cli.conversation_history,
+                            _goal_mode = os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+                            result, response = _run_kanban_worker_turns(
+                                cli,
+                                effective_query,
+                                boundary=_hint_boundary_from_worker_env(),
+                                goal_mode=_goal_mode,
                             )
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
+                        except Exception:
+                            if os.environ.get("HERMES_KANBAN_TASK"):
+                                result = _fixed_kanban_failure()
+                                response = result["final_response"]
+                            else:
+                                raise
                         # Sync session_id if mid-run compression created a
                         # continuation session. The exit line below reports
                         # session_id to stderr for automation wrappers; without
                         # this sync it would point at the ended parent.
-                        if (
-                            getattr(cli.agent, "session_id", None)
-                            and cli.agent.session_id != cli.session_id
-                        ):
-                            cli.session_id = cli.agent.session_id
-                        response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                        agent_session_id = getattr(cli.agent, "session_id", None)
+                        if agent_session_id and agent_session_id != cli.session_id:
+                            cli.session_id = agent_session_id
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout
                         # stays clean for automation wrappers.
+                        _goal_mode_active = (
+                            os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+                            and not _turn_failed(result)
+                        )
                         if (
                             not response
                             and isinstance(result, dict)
@@ -16365,7 +16541,7 @@ def main(
                             and (result.get("failed") or result.get("partial"))
                         ):
                             print(f"Error: {result['error']}", file=sys.stderr)
-                        elif response:
+                        elif response and not _goal_mode_active:
                             print(response)
 
                         # Kanban goal-loop mode: a worker spawned for a
@@ -16375,11 +16551,27 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                        if _goal_mode_active:
+                            _buffered_goal_turns: list[str] = []
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
-                            except Exception as _goal_exc:
-                                logger.debug("kanban goal loop failed: %s", _goal_exc)
+                                _goal_outcome = _run_kanban_goal_loop_q(
+                                    cli, response, emit_turn=_buffered_goal_turns.append
+                                )
+                            except Exception:
+                                from hermes_cli.kanban_hint_delivery import (
+                                    sanitized_hinted_turn_failure,
+                                )
+                                _goal_outcome = {
+                                    "outcome": "turn_failed",
+                                    "turns_used": 1,
+                                    "result": sanitized_hinted_turn_failure(),
+                                }
+                            result, response = _publish_goal_loop_output(
+                                result,
+                                response,
+                                _goal_outcome,
+                                _buffered_goal_turns,
+                            )
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
@@ -16396,20 +16588,7 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
-                        sys.exit(_exit_code)
+                        sys.exit(_kanban_worker_exit_code(result))
 
                 # Exit with error code if credentials or agent init fails
                 sys.exit(1)

@@ -19,10 +19,11 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
@@ -189,6 +190,37 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Argparse builder
 # ---------------------------------------------------------------------------
+
+_INVALID_REQUEST_JSON = '{"error":"invalid_request","ok":false}'
+
+_PROGRAM_CAPABILITIES = (
+    ("version", 1),
+    ("schema", 1),
+    ("cli", 1),
+    ("dispatcher_gate", 1),
+    ("classic_worker_boundary", 1),
+    ("goal_loop_boundary", 1),
+    ("ack_writer", 1),
+    ("events", 1),
+)
+
+
+class _ProgramMutationParser(argparse.ArgumentParser):
+    """Argparse boundary whose failures are safe for machine consumers."""
+
+    def error(self, message: str) -> NoReturn:
+        self._print_message(f"{_INVALID_REQUEST_JSON}\n", sys.stderr)
+        self.exit(2)
+
+
+class _ProgramMutationLeafParser(_ProgramMutationParser):
+    """Reject unknown leaf arguments before they escape to a parent parser."""
+
+    def parse_known_args(self, args=None, namespace=None):
+        parsed, unknown = super().parse_known_args(args, namespace)
+        if unknown:
+            self.error("unrecognized arguments")
+        return parsed, unknown
 
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     """Attach the ``kanban`` subcommand tree under an existing subparsers.
@@ -388,6 +420,34 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_program_create.add_argument("--project", default=None)
     p_program_create.add_argument("--idempotency-key", default=None)
     p_program_create.add_argument("--json", action="store_true")
+
+    program_sub._parser_class = _ProgramMutationLeafParser
+    p_program_capabilities = program_sub.add_parser(
+        "capabilities",
+        help="Report the machine program-control contract",
+    )
+    p_program_capabilities.add_argument("--json", action="store_true", required=True)
+
+    # Program creation keeps the ordinary human-facing argparse contract.
+    # Only the mutation branches below use the machine-only error boundary.
+    program_sub._parser_class = _ProgramMutationParser
+    p_decision = program_sub.add_parser("decision", help="Typed operator decisions")
+    decision_sub = p_decision.add_subparsers(
+        dest="program_decision_action", required=True,
+        parser_class=_ProgramMutationLeafParser,
+    )
+    for name in ("open", "select"):
+        parser = decision_sub.add_parser(name)
+        parser.add_argument("--request-json-stdin", action="store_true", required=True)
+        parser.add_argument("--json", action="store_true", required=True)
+    p_hint = program_sub.add_parser("hint", help="Private operator hints")
+    hint_sub = p_hint.add_subparsers(
+        dest="program_hint_action", required=True,
+        parser_class=_ProgramMutationLeafParser,
+    )
+    p_hint_add = hint_sub.add_parser("add")
+    p_hint_add.add_argument("--request-json-stdin", action="store_true", required=True)
+    p_hint_add.add_argument("--json", action="store_true", required=True)
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -920,20 +980,48 @@ def kanban_command(args: argparse.Namespace) -> int:
     # (rather than threading `board=` through 50+ kb.connect() sites)
     # keeps the patch small and inherits the exact same resolution the
     # dispatcher uses for workers — consistency is a feature here.
+    is_program_capabilities = (
+        action == "program" and getattr(args, "program_action", None) == "capabilities"
+    )
+    is_program_mutation = action == "program" and (
+        (
+            getattr(args, "program_action", None) == "decision"
+            and getattr(args, "program_decision_action", None) in {"open", "select"}
+        )
+        or (
+            getattr(args, "program_action", None) == "hint"
+            and getattr(args, "program_hint_action", None) == "add"
+        )
+    )
     board_override = getattr(args, "board", None)
     board_scope = contextlib.nullcontext()
-    if board_override:
+    if is_program_capabilities and board_override is None:
+        print(_INVALID_REQUEST_JSON, file=sys.stderr)
+        return 2
+    if board_override is not None:
         try:
             normed = kb._normalize_board_slug(board_override)
         except ValueError as exc:
+            if is_program_mutation or is_program_capabilities:
+                print(_INVALID_REQUEST_JSON, file=sys.stderr)
+                return 2
             print(f"kanban: {exc}", file=sys.stderr)
             return 2
         if not normed:
+            if is_program_mutation or is_program_capabilities:
+                print(_INVALID_REQUEST_JSON, file=sys.stderr)
+                return 2
             print("kanban: --board requires a slug", file=sys.stderr)
             return 2
         # Boards other than 'default' must already exist — typoed slugs
         # would otherwise silently create an empty board.
+        if is_program_capabilities and not kb.capability_db_path(normed).is_file():
+            print('{"error":"unknown_board","ok":false}', file=sys.stderr)
+            return 2
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
+            if is_program_mutation or is_program_capabilities:
+                print('{"error":"unknown_board","ok":false}', file=sys.stderr)
+                return 2
             print(
                 f"kanban: board {normed!r} does not exist. "
                 f"Create it with `hermes kanban boards create {normed}`.",
@@ -941,6 +1029,11 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
             return 1
         board_scope = kb.scoped_current_board(normed)
+        if is_program_capabilities:
+            args._normalized_board = normed
+
+    if is_program_capabilities:
+        return _cmd_program_capabilities(args)
 
     # Auto-initialize the DB before dispatching any subcommand. init_db
     # is idempotent, so running it every invocation is cheap (one
@@ -953,13 +1046,16 @@ def kanban_command(args: argparse.Namespace) -> int:
         try:
             kb.init_db()
         except Exception as exc:
+            if is_program_mutation:
+                print('{"error":"database_error","ok":false}', file=sys.stderr)
+                return 1
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
             return 1
 
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
-            "program":  _cmd_program_create,
+            "program":  _cmd_program,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1423,6 +1519,59 @@ def _cmd_program_create(args: argparse.Namespace) -> int:
         print(json.dumps(safe, sort_keys=True, separators=(",", ":")))
     else:
         print(f"Created program {task.id} ({task.status})")
+    return 0
+
+
+def _cmd_program(args: argparse.Namespace) -> int:
+    if args.program_action == "create":
+        return _cmd_program_create(args)
+    from hermes_cli import kanban_program_control as pc
+    if args.program_action == "decision":
+        operation = (pc.open_decision if args.program_decision_action == "open"
+                     else pc.select_decision)
+    elif args.program_action == "hint" and args.program_hint_action == "add":
+        operation = pc.add_hint
+    else:  # pragma: no cover - argparse owns this invariant
+        print('{"error":"invalid_program_action","ok":false}', file=sys.stderr)
+        return 2
+    try:
+        request = pc.parse_request_stdin(sys.stdin.buffer)
+        with kb.connect_closing() as conn:
+            result = operation(conn, request)
+    except pc.ProgramControlError as exc:
+        print(json.dumps({"error": exc.code, "ok": False}, sort_keys=True,
+                         separators=(",", ":")), file=sys.stderr)
+        return 2
+    except Exception:
+        print(json.dumps({"error": "database_error", "ok": False}, sort_keys=True,
+                         separators=(",", ":")), file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def _cmd_program_capabilities(args: argparse.Namespace) -> int:
+    try:
+        board = args._normalized_board
+        kb.validate_current_program_control_schema_read_only(
+            kb.capability_db_path(board)
+        )
+        constants = _PROGRAM_CAPABILITIES
+        if (
+            not isinstance(constants, tuple)
+            or tuple(name for name, _value in constants) != (
+                "version", "schema", "cli", "dispatcher_gate",
+                "classic_worker_boundary", "goal_loop_boundary", "ack_writer", "events",
+            )
+            or any(type(value) is not int or value != 1 for _name, value in constants)
+        ):
+            raise RuntimeError("incomplete capability contract")
+        result = {"contract": "hermes-program-control", "board": board}
+        result.update(constants)
+    except Exception:
+        print('{"error":"database_error","ok":false}', file=sys.stderr)
+        return 1
+    print(json.dumps(result, separators=(",", ":")))
     return 0
 
 
@@ -2849,13 +2998,21 @@ def run_slash(rest: str) -> str:
     # reject before argparse dispatch so no future handler refactor can expose
     # this mutation surface outside trusted direct OS argv.
     command_tokens = [token for token in tokens if not token.startswith("--board=")]
-    if command_tokens[:2] == ["program", "create"] or (
+    is_capabilities = (
+        command_tokens == ["program", "capabilities", "--json"]
+        or (
+            len(command_tokens) == 5
+            and command_tokens[0] == "--board"
+            and command_tokens[2:] == ["program", "capabilities", "--json"]
+        )
+    )
+    if not is_capabilities and ((command_tokens and command_tokens[0] == "program") or (
         len(command_tokens) >= 4
         and command_tokens[0] == "--board"
-        and command_tokens[2:4] == ["program", "create"]
-    ):
+        and command_tokens[2] == "program"
+    )):
         return (
-            "⚠ /kanban program create is restricted to the trusted direct "
+            "⚠ /kanban program mutations are restricted to the trusted direct "
             "OS argv CLI"
         )
 

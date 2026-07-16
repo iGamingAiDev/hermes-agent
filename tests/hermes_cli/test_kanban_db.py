@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import os
 import sqlite3
 import subprocess
@@ -15,6 +16,22 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+class _RecordingConnection:
+    def __init__(self, connection, statements):
+        object.__setattr__(self, "_connection", connection)
+        object.__setattr__(self, "_statements", statements)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._connection, name, value)
+
+    def execute(self, sql, *args, **kwargs):
+        self._statements.append(sql)
+        return self._connection.execute(sql, *args, **kwargs)
 
 
 @pytest.fixture
@@ -3430,6 +3447,730 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
     conn.close()
 
 
+@pytest.mark.parametrize("task_pk", ["TEXT PRIMARY KEY", "INTEGER PRIMARY KEY"])
+def test_direct_migration_creates_canonical_program_control_schema(task_pk):
+    """The legacy helper alone installs the complete canonical A3 schema."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        f"CREATE TABLE tasks (id {task_pk}, title TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'todo', created_at INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute(
+        "CREATE TABLE task_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+        "run_id INTEGER, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+    )
+
+    kb._migrate_add_optional_columns(conn)
+    kb._migrate_add_optional_columns(conn)
+
+    fresh = sqlite3.connect(":memory:")
+    fresh.row_factory = sqlite3.Row
+    fresh.executescript(kb.SCHEMA_SQL)
+    kb._migrate_add_optional_columns(fresh)
+    for table, expected_columns in kb._PROGRAM_CONTROL_COLUMNS.items():
+        assert {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        } == expected_columns
+        assert [tuple(row) for row in conn.execute(f"PRAGMA foreign_key_list({table})")] == [
+            tuple(row) for row in fresh.execute(f"PRAGMA foreign_key_list({table})")
+        ]
+
+    migrated_indexes = {
+        row["name"]: row["sql"]
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+            "AND name LIKE 'idx_program_%'"
+        )
+    }
+    fresh_indexes = {
+        row["name"]: row["sql"]
+        for row in fresh.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+            "AND name LIKE 'idx_program_%'"
+        )
+    }
+    assert migrated_indexes == fresh_indexes
+
+
+def test_direct_migration_rejects_drifted_a3_schema_before_side_effects():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL)")
+    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL)")
+    conn.execute("CREATE TABLE program_hints (root_id TEXT NOT NULL)")
+    before = list(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name"))
+
+    with pytest.raises(RuntimeError, match="program_hints schema"):
+        kb._migrate_add_optional_columns(conn)
+
+    assert list(conn.execute(
+        "SELECT type, name, sql FROM sqlite_master ORDER BY name"
+    )) == before
+
+
+@pytest.mark.parametrize(
+    "version_ddl",
+    [
+        "program_control_version TEXT NOT NULL DEFAULT 0 "
+        "CHECK (program_control_version >= 0 AND program_control_version <= 9007199254740991)",
+        "program_control_version INTEGER DEFAULT 0 "
+        "CHECK (program_control_version >= 0 AND program_control_version <= 9007199254740991)",
+        "program_control_version INTEGER NOT NULL DEFAULT 1 "
+        "CHECK (program_control_version >= 0 AND program_control_version <= 9007199254740991)",
+        "program_control_version INTEGER NOT NULL DEFAULT 0",
+        "program_control_version INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (program_control_version >= 0)",
+        "program_control_version INTEGER NOT NULL DEFAULT 0 "
+        "CHECK (program_control_version >= 0 AND program_control_version < 9007199254740991)",
+    ],
+    ids=["type", "not-null", "default", "missing-check", "lower-only-check", "wrong-upper-check"],
+)
+def test_direct_migration_rejects_program_version_drift_before_a3_side_effects(
+    version_ddl,
+):
+    """An existing version column is validate-only, never repaired in place."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"CREATE TABLE tasks (id TEXT PRIMARY KEY, {version_ddl})")
+    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL)")
+    before = list(conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"))
+
+    with pytest.raises(RuntimeError, match="tasks.program_control_version schema"):
+        kb._migrate_add_optional_columns(conn)
+
+    assert list(conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    )) == before
+
+
+def test_program_control_drift_preflight_does_not_mutate_delete_database(tmp_path):
+    path = tmp_path / "drift-preflight.db"
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    kb._migrate_add_optional_columns(conn)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("DROP TABLE program_hints")
+    conn.execute("CREATE TABLE program_hints (root_id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO tasks (id,title,status,created_at) VALUES ('kept','Kept','done',1)")
+    conn.commit()
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    conn.close()
+    before = path.read_bytes()
+    wal = path.with_name(path.name + "-wal")
+    shm = path.with_name(path.name + "-shm")
+    assert not wal.exists()
+    assert not shm.exists()
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(RuntimeError, match="program_hints.*schema"):
+        kb.connect(path)
+
+    assert path.read_bytes() == before
+    assert not wal.exists()
+    assert not shm.exists()
+    probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    assert probe.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    assert probe.execute("SELECT title FROM tasks WHERE id='kept'").fetchone()[0] == "Kept"
+    probe.close()
+
+
+_PHASE2_PROGRAM_HINTS_DDL = """
+CREATE TABLE IF NOT EXISTS program_hints (
+    root_id TEXT NOT NULL,
+    hint_id TEXT NOT NULL, node_id TEXT NOT NULL,
+    text TEXT NOT NULL, actor TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    expected_node_version INTEGER NOT NULL, committed_node_version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('recorded','seen','incorporated','deferred','rejected','reconcile')),
+    run_id INTEGER, claim_lock TEXT, profile TEXT, created_at INTEGER NOT NULL,
+    delivered_at INTEGER, terminal_at INTEGER, terminal_reason_code TEXT,
+    PRIMARY KEY (root_id, hint_id), UNIQUE (root_id, idempotency_key),
+    FOREIGN KEY (root_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id, node_id) REFERENCES task_runs(id, task_id)
+)
+"""
+
+
+def _install_phase2_program_hints(path, *, ddl=_PHASE2_PROGRAM_HINTS_DDL):
+    kb.init_db(path)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("DROP TABLE program_hints")
+    conn.execute(ddl)
+    conn.execute(
+        "CREATE INDEX idx_program_hints_node_state "
+        "ON program_hints(root_id, node_id, state, created_at)"
+    )
+    conn.execute(
+        "INSERT INTO tasks(id,title,status,created_at,orchestration_root_id) "
+        "VALUES('root','canary task','todo',1,'root')"
+    )
+    rows = [
+        ("root", "h1", "root", "canary\ntext Ω", "control:owner", "key-1",
+         3, 4, "recorded", None, None, None, 11, None, None, None),
+        ("root", "h2", "root", '{"metadata":"canary","n":2}', "control:owner",
+         "key-2", 4, 5, "recorded", None, None, None, 12, None, None, None),
+    ]
+    conn.executemany(
+        "INSERT INTO program_hints VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows
+    )
+    conn.commit()
+    conn.close()
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+    return rows
+
+
+def _database_artifacts(path):
+    paths = (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"))
+    return {
+        item: (
+            item.exists(),
+            item.read_bytes() if item.exists() else None,
+            kb._snapshot_signature(item),
+        )
+        for item in paths
+    }
+
+
+def _database_schema_and_data(path):
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        master = conn.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall()
+        tables = [row[1] for row in master if row[0] == "table"]
+        data = {}
+        for table in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            data[table] = conn.execute(f"SELECT * FROM {quoted}").fetchall()
+        return master, data
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("object_sql", "populate"),
+    [
+        ("CREATE VIEW dependent_view AS SELECT * FROM program_hints", False),
+        ("CREATE VIEW dependent_view AS SELECT * FROM program_hints", True),
+        (
+            "CREATE TRIGGER dependent_trigger AFTER UPDATE ON program_hints "
+            "BEGIN SELECT NEW.hint_id; END",
+            False,
+        ),
+        (
+            "CREATE TRIGGER dependent_trigger AFTER UPDATE ON program_hints "
+            "BEGIN SELECT NEW.hint_id; END",
+            True,
+        ),
+        (
+            "CREATE TRIGGER dependent_trigger AFTER UPDATE ON tasks BEGIN "
+            "SELECT hint_id FROM program_hints; END",
+            False,
+        ),
+        (
+            "CREATE TRIGGER dependent_trigger AFTER UPDATE ON tasks BEGIN "
+            "UPDATE program_hints SET text = text WHERE root_id = NEW.id; END",
+            True,
+        ),
+    ],
+)
+def test_phase2_program_hints_rejects_external_view_trigger_dependencies_without_mutation(
+    tmp_path, object_sql, populate
+):
+    path = tmp_path / "phase2-dependent-object.db"
+    _install_phase2_program_hints(path)
+    conn = sqlite3.connect(path)
+    conn.execute(object_sql)
+    if populate:
+        conn.execute("UPDATE tasks SET title='populated dependency' WHERE id='root'")
+    conn.commit()
+    conn.close()
+
+    schema_and_data_before = _database_schema_and_data(path)
+    artifacts_before = _database_artifacts(path)
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(
+        RuntimeError,
+        match="program_hints Phase2 migration blocked by external view or trigger",
+    ):
+        kb.connect(path)
+
+    assert _database_artifacts(path) == artifacts_before
+    assert _database_schema_and_data(path) == schema_and_data_before
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "program_hints",
+        "main.program_hints",
+        '\"program_hints\"',
+        "`program_hints`",
+        "[program_hints]",
+        '\"main\".\"PrOgRaM_HiNtS\"',
+        "`main`.`PROGRAM_HINTS`",
+        "[main].[program_hints]",
+    ],
+)
+def test_phase2_program_hints_rejects_quoted_external_dependencies_without_mutation(
+    tmp_path, reference
+):
+    path = tmp_path / "phase2-quoted-dependency.db"
+    _install_phase2_program_hints(path)
+    conn = sqlite3.connect(path)
+    conn.execute(f"CREATE VIEW dependent_view AS SELECT * FROM {reference}")
+    conn.commit()
+    conn.close()
+    before_content = _database_schema_and_data(path)
+    before = _database_artifacts(path)
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(RuntimeError, match="external view or trigger"):
+        kb.connect(path)
+
+    assert _database_artifacts(path) == before
+    assert _database_schema_and_data(path) == before_content
+
+
+@pytest.mark.parametrize(
+    "object_sql",
+    [
+        "CREATE VIEW dependent_view AS SELECT * FROM 'program_hints'",
+        "CREATE VIEW dependent_view AS SELECT p.hint_id FROM main.'program_hints' AS p",
+        "CREATE VIEW dependent_view AS SELECT t.id FROM tasks AS t "
+        "JOIN 'program_hints' AS p ON p.root_id = t.id",
+        "CREATE TRIGGER dependent_trigger AFTER UPDATE ON tasks BEGIN "
+        "INSERT INTO 'program_hints' SELECT * FROM 'program_hints' WHERE 0; END",
+        "CREATE TRIGGER dependent_trigger AFTER UPDATE ON tasks BEGIN "
+        "UPDATE 'program_hints' SET text = text WHERE root_id = NEW.id; END",
+        "CREATE TRIGGER dependent_trigger AFTER UPDATE ON tasks BEGIN "
+        "DELETE FROM 'program_hints' WHERE root_id = NEW.id; END",
+    ],
+)
+def test_phase2_program_hints_rejects_single_quoted_identifier_dependencies_without_mutation(
+    tmp_path, object_sql
+):
+    path = tmp_path / "phase2-single-quoted-dependency.db"
+    _install_phase2_program_hints(path)
+    conn = sqlite3.connect(path)
+    conn.execute(object_sql)
+    conn.commit()
+    conn.close()
+    before_content = _database_schema_and_data(path)
+    before = _database_artifacts(path)
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(RuntimeError, match="external view or trigger"):
+        kb.connect(path)
+
+    assert _database_artifacts(path) == before
+    assert _database_schema_and_data(path) == before_content
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT * FROM 'program_hints' AS p", True),
+        ("SELECT * FROM (main.'program_hints') p", True),
+        ("SELECT * FROM tasks JOIN ('program_hints') p ON 1", True),
+        ("INSERT OR REPLACE INTO 'program_hints' VALUES (1)", True),
+        ("UPDATE OR ROLLBACK 'program_hints' AS p SET text = text", True),
+        ("UPDATE OR ABORT 'program_hints' SET text = text", True),
+        ("UPDATE OR FAIL 'program_hints' SET text = text", True),
+        ("UPDATE OR IGNORE 'program_hints' SET text = text", True),
+        ("UPDATE OR REPLACE 'program_hints' SET text = text", True),
+        ("DELETE FROM main.'program_hints' AS p", True),
+        ("SELECT 'program_hints' AS value FROM tasks", False),
+        ("SELECT 'program_hints'' doubled' FROM tasks", False),
+        ("INSERT INTO tasks VALUES ('program_hints')", False),
+        ("UPDATE tasks SET title = 'program_hints'", False),
+        ("DELETE FROM tasks WHERE title = 'program_hints'", False),
+        ("SELECT * FROM program_hints_near -- FROM 'program_hints'\n", False),
+    ],
+)
+def test_sqlite_identifier_lexer_single_quotes_only_in_table_context(sql, expected):
+    assert ("program_hints" in kb._sqlite_sql_identifier_tokens(sql)) is expected
+
+
+def test_phase2_legacy_verification_recognizes_single_quoted_table_and_rolls_back():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    before = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()
+
+    conn.execute("BEGIN")
+    conn.execute(
+        "CREATE VIEW leaked_legacy AS "
+        "SELECT * FROM main.'program_hints_phase2' AS legacy"
+    )
+    with pytest.raises(RuntimeError, match="legacy SQL reference"):
+        kb._validate_program_hints_phase2_removed(conn)
+    conn.rollback()
+
+    assert conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall() == before
+    conn.close()
+
+
+@pytest.mark.parametrize("bad_sql", [None, "CREATE VIEW broken AS SELECT /*"])
+def test_phase2_program_hints_rejects_unverifiable_view_sql_without_mutation(
+    tmp_path, bad_sql
+):
+    path = tmp_path / "phase2-unverifiable-view.db"
+    _install_phase2_program_hints(path)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE VIEW broken AS SELECT 1")
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute("UPDATE sqlite_master SET sql=? WHERE type='view' AND name='broken'", (bad_sql,))
+    conn.execute("PRAGMA writable_schema=OFF")
+    conn.commit()
+    conn.close()
+    before = _database_artifacts(path)
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(RuntimeError):
+        kb.connect(path)
+
+    assert _database_artifacts(path) == before
+
+
+@pytest.mark.parametrize("bad_sql", [None, "", "SELECT 'unterminated", "SELECT /*"])
+def test_sqlite_identifier_lexer_fails_closed_on_missing_or_malformed_sql(bad_sql):
+    with pytest.raises(ValueError):
+        kb._sqlite_sql_identifier_tokens(bad_sql)
+
+
+def test_phase2_program_hints_literal_comment_and_near_identifier_controls_migrate(tmp_path):
+    path = tmp_path / "phase2-unrelated-objects.db"
+    expected_rows = _install_phase2_program_hints(path)
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE my_program_hints(value TEXT);"
+        "INSERT INTO my_program_hints VALUES('near-name canary');"
+        "CREATE VIEW unrelated_view AS "
+        "SELECT 'program_hints' AS literal, 'program_hints'' doubled' AS doubled, "
+        "value FROM my_program_hints AS near_alias "
+        "/* program_hints */;"
+        "CREATE TRIGGER unrelated_trigger AFTER UPDATE ON tasks "
+        "WHEN NEW.title <> 'program_hints' BEGIN "
+        "-- program_hints\n"
+        "INSERT INTO my_program_hints VALUES('program_hints'' value'); END;"
+    )
+    conn.commit()
+    objects_before = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE name IN ('unrelated_view','unrelated_trigger') ORDER BY name"
+    ).fetchall()
+    conn.close()
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with kb.connect_closing(path) as migrated:
+        assert [tuple(row) for row in migrated.execute(
+            "SELECT * FROM program_hints ORDER BY hint_id"
+        )] == expected_rows
+        assert [tuple(row) for row in migrated.execute("SELECT * FROM unrelated_view")] == [
+            ("program_hints", "program_hints' doubled", "near-name canary")
+        ]
+        assert [tuple(row) for row in migrated.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master "
+            "WHERE name IN ('unrelated_view','unrelated_trigger') ORDER BY name"
+        )] == objects_before
+        migrated.execute("UPDATE tasks SET title='trigger canary' WHERE id='root'")
+        assert [tuple(row) for row in migrated.execute(
+            "SELECT value FROM my_program_hints ORDER BY rowid"
+        )] == [("near-name canary",), ("program_hints' value",)]
+
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+    with kb.connect_closing(path) as reopened:
+        assert reopened.execute("SELECT count(*) FROM program_hints").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("collision_type", ["table", "view", "index"])
+def test_phase2_program_hints_rejects_temporary_name_collisions_without_mutation(
+    tmp_path, collision_type
+):
+    """Every constructible SQLite schema-object collision fails in preflight.
+
+    Executed namespace evidence: SQLite accepts each of CREATE TABLE, CREATE
+    VIEW, and CREATE INDEX with this name when attempted independently.
+    """
+    path = tmp_path / f"phase2-{collision_type}-collision.db"
+    _install_phase2_program_hints(path)
+    conn = sqlite3.connect(path)
+    if collision_type == "table":
+        conn.execute("CREATE TABLE program_hints_phase2 (canary TEXT)")
+        conn.execute("INSERT INTO program_hints_phase2 VALUES ('table canary')")
+    elif collision_type == "view":
+        conn.execute(
+            "CREATE VIEW program_hints_phase2 AS SELECT 'view canary' AS canary"
+        )
+    else:
+        conn.execute("CREATE INDEX program_hints_phase2 ON tasks(title)")
+    conn.commit()
+    conn.close()
+
+    schema_and_data_before = _database_schema_and_data(path)
+    artifacts_before = _database_artifacts(path)
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(
+        RuntimeError,
+        match="program_hints Phase2 migration blocked by existing "
+        "program_hints_phase2 schema object",
+    ):
+        kb.connect(path)
+
+    assert _database_artifacts(path) == artifacts_before
+    assert _database_schema_and_data(path) == schema_and_data_before
+
+
+def test_phase2_program_hints_migrates_losslessly_and_idempotently(tmp_path):
+    path = tmp_path / "phase2.db"
+    expected_rows = _install_phase2_program_hints(path)
+
+    with kb.connect_closing(path) as conn:
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM program_hints ORDER BY hint_id"
+        )] == expected_rows
+        objects = list(conn.execute(
+            "SELECT type,name FROM sqlite_master WHERE name='program_hints_phase2'"
+        ))
+        assert objects == []
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )]
+        assert all(
+            fk["table"] != "program_hints_phase2"
+            for table in tables
+            for fk in conn.execute(
+                f'PRAGMA foreign_key_list("{table.replace(chr(34), chr(34) * 2)}")'
+            )
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        migrated_shape = kb._program_control_shape(conn, "program_hints")
+        assert [tuple(row) for row in conn.execute(
+            "PRAGMA index_info(idx_program_hints_node_state)"
+        )] == [(0, 0, "root_id"), (1, 2, "node_id"),
+              (2, 8, "state"), (3, 12, "created_at")]
+
+    fresh = sqlite3.connect(":memory:")
+    fresh.row_factory = sqlite3.Row
+    fresh.executescript(
+        "CREATE TABLE tasks(id TEXT PRIMARY KEY, orchestration_root_id TEXT);"
+        "CREATE TABLE task_runs(id INTEGER PRIMARY KEY, task_id TEXT NOT NULL);"
+    )
+    kb._create_program_control_schema(fresh)
+    assert migrated_shape == kb._program_control_shape(fresh, "program_hints")
+    fresh.close()
+
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+    with kb.connect_closing(path) as conn:
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM program_hints ORDER BY hint_id"
+        )] == expected_rows
+
+
+@pytest.mark.parametrize(
+    ("child_table", "with_row"),
+    [
+        ("external_hint_refs", False),
+        ("external_hint_refs", True),
+        ('awkward " child; DROP TABLE tasks; --', False),
+    ],
+)
+def test_phase2_program_hints_rejects_inbound_foreign_keys_without_mutation(
+    tmp_path, child_table, with_row
+):
+    path = tmp_path / f"phase2-inbound-{with_row}.db"
+    expected_rows = _install_phase2_program_hints(path)
+    quoted_child = '"' + child_table.replace('"', '""') + '"'
+    conn = sqlite3.connect(path)
+    conn.execute(
+        f"CREATE TABLE {quoted_child} ("
+        "root_id TEXT NOT NULL, hint_id TEXT NOT NULL, payload TEXT, "
+        "FOREIGN KEY (root_id, hint_id) "
+        "REFERENCES program_hints(root_id, hint_id))"
+    )
+    if with_row:
+        conn.execute(
+            f"INSERT INTO {quoted_child} VALUES ('root', 'h1', 'child canary')"
+        )
+    conn.commit()
+    master_before = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()
+    child_before = conn.execute(f"SELECT * FROM {quoted_child}").fetchall()
+    conn.close()
+
+    paths = [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
+    before = {
+        item: (item.exists(), item.read_bytes() if item.exists() else None)
+        for item in paths
+    }
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(
+        RuntimeError,
+        match="program_hints Phase2 migration blocked by inbound foreign key",
+    ):
+        kb.connect(path)
+
+    after = {
+        item: (item.exists(), item.read_bytes() if item.exists() else None)
+        for item in paths
+    }
+    assert after == before
+    probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    assert probe.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall() == master_before
+    assert probe.execute(f"SELECT * FROM {quoted_child}").fetchall() == child_before
+    assert probe.execute("SELECT * FROM program_hints ORDER BY hint_id").fetchall() == expected_rows
+    assert probe.execute("SELECT title FROM tasks WHERE id='root'").fetchone()[0] == "canary task"
+    probe.close()
+
+
+@pytest.mark.parametrize("bad_shape", ["invalid-row", "near-ddl"])
+def test_phase2_program_hints_rejects_invalid_predecessors_without_mutation(
+    tmp_path, bad_shape
+):
+    path = tmp_path / f"phase2-{bad_shape}.db"
+    ddl = (_PHASE2_PROGRAM_HINTS_DDL.replace("text TEXT NOT NULL", "text BLOB NOT NULL", 1)
+           if bad_shape == "near-ddl" else _PHASE2_PROGRAM_HINTS_DDL)
+    _install_phase2_program_hints(path, ddl=ddl)
+    conn = sqlite3.connect(path)
+    if bad_shape == "invalid-row":
+        conn.execute(
+            "UPDATE program_hints SET state='seen',run_id=99,claim_lock='x',"
+            "profile='p',delivered_at=13 WHERE hint_id='h1'"
+        )
+        conn.commit()
+    before_rows = conn.execute("SELECT * FROM program_hints ORDER BY hint_id").fetchall()
+    conn.close()
+    before_bytes = path.read_bytes()
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    with pytest.raises(RuntimeError, match="program_hints"):
+        kb.connect(path)
+
+    assert path.read_bytes() == before_bytes
+    probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    assert probe.execute("SELECT * FROM program_hints ORDER BY hint_id").fetchall() == before_rows
+    probe.close()
+
+
+def test_program_control_wal_drift_preflight_preserves_original_and_sidecars(tmp_path):
+    path = tmp_path / "drift-wal.db"
+    writer = sqlite3.connect(path)
+    writer.row_factory = sqlite3.Row
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.executescript(kb.SCHEMA_SQL)
+    kb._migrate_add_optional_columns(writer)
+    writer.commit()
+    writer.execute("DROP TABLE program_hints")
+    writer.execute("CREATE TABLE program_hints (root_id TEXT PRIMARY KEY)")
+    writer.execute("INSERT INTO tasks (id,title,status,created_at) VALUES ('wal-row','WAL','todo',1)")
+    writer.commit()
+
+    paths = [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
+    assert paths[1].exists()
+    before = {
+        item: (item.exists(), item.read_bytes() if item.exists() else None,
+               item.stat().st_mtime_ns if item.exists() else None)
+        for item in paths
+    }
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+    with pytest.raises(RuntimeError, match="program_hints.*schema"):
+        kb.connect(path)
+    after = {
+        item: (item.exists(), item.read_bytes() if item.exists() else None,
+               item.stat().st_mtime_ns if item.exists() else None)
+        for item in paths
+    }
+    assert after == before
+    assert writer.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert writer.execute("SELECT title FROM tasks WHERE id='wal-row'").fetchone()[0] == "WAL"
+    writer.close()
+
+
+@pytest.mark.parametrize("drift_class,table,rewrite", [
+    ("type", "program_decisions", lambda sql: sql.replace(
+        "version INTEGER NOT NULL DEFAULT 1", "version TEXT NOT NULL DEFAULT 1", 1)),
+    ("not-null", "program_decisions", lambda sql: sql.replace(
+        "title TEXT NOT NULL", "title TEXT", 1)),
+    ("default", "program_decisions", lambda sql: sql.replace(
+        "DEFAULT 1", "DEFAULT 2", 1)),
+    ("check", "program_decisions", lambda sql: sql.replace(
+        " AND version <= 9007199254740991", "", 1)),
+    ("foreign-key", "program_decision_affected_nodes", lambda sql: sql.replace(
+        "ON DELETE CASCADE", "ON DELETE RESTRICT", 1)),
+    ("request-root-foreign-key", "program_control_requests", lambda sql: sql.replace(
+        "FOREIGN KEY (root_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE",
+        "FOREIGN KEY (root_id) REFERENCES tasks(id) ON DELETE CASCADE", 1)),
+    ("unique", "program_hints", lambda sql: sql.replace(
+        "UNIQUE (root_id, idempotency_key)", "UNIQUE (root_id, actor)", 1)),
+])
+def test_program_schema_constraint_drift_fails_before_any_mutation(
+    tmp_path, drift_class, table, rewrite
+):
+    path = tmp_path / f"drift-{drift_class}.db"
+    kb.init_db(path)
+    conn = sqlite3.connect(path)
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()[0]
+    changed = rewrite(sql)
+    assert changed != sql
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute("UPDATE sqlite_master SET sql=? WHERE type='table' AND name=?",
+                 (changed, table))
+    conn.execute("PRAGMA writable_schema=OFF")
+    conn.commit()
+    conn.close()
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    probe = sqlite3.connect(path)
+    before = probe.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()
+    probe.close()
+    with pytest.raises(RuntimeError, match=f"{table} schema"):
+        kb.init_db(path)
+    probe = sqlite3.connect(path)
+    assert probe.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall() == before
+    probe.close()
+
+
+def test_program_named_index_drift_fails_before_any_mutation(tmp_path):
+    path = tmp_path / "drift-index.db"
+    kb.init_db(path)
+    conn = sqlite3.connect(path)
+    conn.execute("DROP INDEX idx_program_hints_node_state")
+    conn.commit()
+    before = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall()
+    conn.close()
+    kb._INITIALIZED_PATHS.discard(str(path.resolve()))
+    with pytest.raises(RuntimeError, match="schema is incomplete or incompatible"):
+        kb.init_db(path)
+    conn = sqlite3.connect(path)
+    assert conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+    ).fetchall() == before
+    conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher spawn invocation — _resolve_hermes_argv()
 #
@@ -4330,6 +5071,115 @@ def test_connect_refuses_corrupt_existing_file(tmp_path):
 
     with pytest.raises(kb.KanbanDbCorruptError):
         kb.connect(db_path=db_path)
+
+
+def test_original_connection_validates_schema_before_integrity_or_pragmas(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    statements = []
+    real_sqlite_connect = kb._sqlite_connect
+
+    def recording_connect(path, *args, **kwargs):
+        connection = real_sqlite_connect(path, *args, **kwargs)
+        if Path(path).resolve() == db_path.resolve():
+            return _RecordingConnection(connection, statements)
+        return connection
+
+    monkeypatch.setattr(kb, "_sqlite_connect", recording_connect)
+    with kb.connect_closing(db_path=db_path):
+        pass
+
+    assert statements[0].startswith("SELECT sql FROM sqlite_master")
+    integrity_index = statements.index("PRAGMA integrity_check")
+    assert integrity_index > 0
+    assert all("busy_timeout" not in sql for sql in statements[:integrity_index])
+
+
+def test_original_schema_drift_stops_before_integrity_and_side_effects(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    statements = []
+    real_sqlite_connect = kb._sqlite_connect
+    real_validate = kb._validate_existing_program_control_schema
+    validation_calls = 0
+
+    def recording_connect(path, *args, **kwargs):
+        connection = real_sqlite_connect(path, *args, **kwargs)
+        if Path(path).resolve() == db_path.resolve():
+            return _RecordingConnection(connection, statements)
+        return connection
+
+    def drift_on_original(connection):
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 2:
+            connection.execute("SELECT 'schema-validation-canary'")
+            raise RuntimeError("schema drift canary")
+        real_validate(connection)
+
+    monkeypatch.setattr(kb, "_sqlite_connect", recording_connect)
+    monkeypatch.setattr(kb, "_validate_existing_program_control_schema", drift_on_original)
+    with pytest.raises(RuntimeError, match="schema drift canary"):
+        kb.connect(db_path=db_path)
+
+    assert statements == ["SELECT 'schema-validation-canary'"]
+    assert list(tmp_path.glob("*.corrupt.*")) == []
+
+
+def test_schema_validation_database_error_backs_up_original(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    original = db_path.read_bytes()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    monkeypatch.setattr(
+        kb,
+        "_validate_existing_program_control_schema",
+        lambda _connection: (_ for _ in ()).throw(sqlite3.DatabaseError("malformed")),
+    )
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.connect(db_path=db_path)
+
+    assert excinfo.value.backup_path is not None
+    assert excinfo.value.backup_path.read_bytes() == original
+
+
+def test_copy_snapshot_retries_without_noatime_for_portable_permission_error(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    source.write_bytes(b"stable snapshot bytes")
+    noatime = 0x40000
+    monkeypatch.setattr(kb.os, "O_NOATIME", noatime, raising=False)
+    real_open = kb.os.open
+    calls = []
+
+    def noatime_denied(path, flags, *args, **kwargs):
+        calls.append(flags)
+        if flags & noatime:
+            raise OSError(errno.EPERM, "no O_NOATIME permission")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(kb.os, "open", noatime_denied)
+    kb._copy_snapshot_file(source, target)
+
+    assert calls == [kb.os.O_RDONLY | noatime, kb.os.O_RDONLY]
+    assert target.read_bytes() == source.read_bytes()
+
+
+def test_normal_startup_with_snapshot_copy(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect_closing(db_path=db_path) as conn:
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
 
 
 def test_repeated_corrupt_open_reuses_single_backup(tmp_path):

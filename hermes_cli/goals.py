@@ -1601,6 +1601,38 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
 )
 
 
+@dataclass(frozen=True)
+class KanbanGoalTurnResult:
+    """Narrow result crossing the private provider/goal-loop boundary."""
+
+    response: str = ""
+    failed: bool = False
+    partial: bool = False
+    failure_reason: Optional[str] = None
+
+
+def _fixed_goal_turn_failure(turn: Optional[KanbanGoalTurnResult] = None) -> Dict[str, Any]:
+    """Build the closed public failure contract without provider payload data."""
+    from hermes_cli.kanban_hint_delivery import sanitized_hinted_turn_failure
+
+    raw: Dict[str, Any] = {"failed": True}
+    if turn is not None:
+        raw = {"failed": turn.failed, "partial": turn.partial}
+        if turn.failure_reason in ("rate_limit", "billing"):
+            raw["failure_reason"] = turn.failure_reason
+    if raw == {"failed": True}:
+        return sanitized_hinted_turn_failure()
+    from hermes_cli.kanban_hint_delivery import sanitize_hinted_turn_result
+    return sanitize_hinted_turn_result(raw, ({"text": "private"},))
+
+
+def _normalize_goal_turn_result(value: Any) -> KanbanGoalTurnResult:
+    """Accept the legacy string callback without copying provider mappings."""
+    if isinstance(value, KanbanGoalTurnResult):
+        return value
+    return KanbanGoalTurnResult(response=value if isinstance(value, str) else str(value or ""))
+
+
 def run_kanban_goal_loop(
     *,
     task_id: str,
@@ -1611,6 +1643,9 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    prepare_turn=None,
+    ack_turn=None,
+    emit_turn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1647,6 +1682,13 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
+    def _operational_failure() -> Dict[str, Any]:
+        return {
+            "outcome": "operational_failed",
+            "turns_used": turns_used,
+            "result": _fixed_goal_turn_failure(),
+        }
+
     max_turns = int(max_turns or DEFAULT_MAX_TURNS)
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
@@ -1660,9 +1702,13 @@ def run_kanban_goal_loop(
         # Did the worker terminate the task itself this turn?
         try:
             status = task_status_fn()
-        except Exception as exc:
-            _log(f"kanban goal loop: status check failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": "status check failed"}
+        except Exception:
+            _log("kanban goal loop: status check failed")
+            return _operational_failure()
+
+        if status is None:
+            _log("kanban goal loop: task status unavailable")
+            return _operational_failure()
 
         if status == "done":
             _log(f"kanban goal loop: task {task_id} completed by worker after {turns_used} turn(s)")
@@ -1670,16 +1716,22 @@ def run_kanban_goal_loop(
         if status == "blocked":
             _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
             return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
-        if status not in ("running", "ready"):
-            # Reclaimed / archived / unexpected — let the dispatcher own it.
-            _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
+        if status != "running":
+            _log(f"kanban goal loop: task {task_id} has no active worker authority")
+            return _operational_failure()
 
         # Still open — judge whether the latest response satisfies the card.
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait = judge_goal(goal_text, last_response)
+        try:
+            verdict, reason, parse_failed, _wait = judge_goal(goal_text, last_response)
+        except Exception:
+            _log("kanban goal loop: judge failed")
+            return _operational_failure()
+        if parse_failed:
+            _log("kanban goal loop: judge response could not be parsed")
+            return _operational_failure()
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
@@ -1694,8 +1746,9 @@ def run_kanban_goal_loop(
                         f"Goal-mode worker's output looked complete but it never "
                         f"called kanban_complete after a finalize nudge ({reason})."
                     )
-                except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
+                except Exception:
+                    _log("kanban goal loop: block persistence failed")
+                    return _operational_failure()
                 return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
@@ -1711,17 +1764,46 @@ def run_kanban_goal_loop(
                     f"({turns_used}/{max_turns}) without completing the task. "
                     f"Last judge verdict: {_truncate(reason, 300)}"
                 )
-            except Exception as exc:
-                _log(f"kanban goal loop: block_fn failed ({exc})")
+            except Exception:
+                _log("kanban goal loop: block persistence failed")
+                return _operational_failure()
             return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
 
         # Run another turn in the same session.
+        batch = []
         try:
-            last_response = run_turn(prompt) or ""
-        except Exception as exc:
-            _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
+            if prepare_turn is not None:
+                prompt, batch = prepare_turn(prompt)
+        except Exception:
+            return _operational_failure()
+        try:
+            turn = _normalize_goal_turn_result(run_turn(prompt))
+        except Exception:
+            return {
+                "outcome": "turn_failed",
+                "turns_used": turns_used + 1,
+                "result": _fixed_goal_turn_failure(),
+            }
         turns_used += 1
+        try:
+            if turn.failed or turn.partial:
+                return {
+                    "outcome": "turn_failed",
+                    "turns_used": turns_used,
+                    "result": _fixed_goal_turn_failure(turn),
+                }
+            last_response = turn.response
+            if batch:
+                from hermes_cli.kanban_hint_delivery import sanitize_hinted_turn_result
+                last_response = sanitize_hinted_turn_result(
+                    {"final_response": last_response}, batch
+                )["final_response"]
+            if batch and ack_turn is not None:
+                ack_turn(batch)
+            if last_response and emit_turn is not None:
+                emit_turn(last_response)
+        except Exception:
+            return _operational_failure()
 
 
 __all__ = [
@@ -1739,6 +1821,7 @@ __all__ = [
     "DRAFT_CONTRACT_SYSTEM_PROMPT",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "KanbanGoalTurnResult",
     "DEFAULT_MAX_TURNS",
     "load_goal",
     "save_goal",

@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -81,6 +82,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -533,6 +535,21 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
+def capability_db_path(board: str) -> Path:
+    """Return the canonical DB path for an explicit capability board.
+
+    Capability negotiation is a statement about the board named on the wire,
+    so it must not inherit worker/current-board routing or the legacy direct DB
+    override used by normal runtime connections.
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        raise ValueError("board slug is required")
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban.db"
     return board_dir(slug) / "kanban.db"
@@ -1057,6 +1074,7 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    program_control_version: int = 0
     orchestration_policy: Optional[OrchestrationPolicy] = None
     orchestration_root_id: Optional[str] = None
     orchestration_depth: Optional[int] = None
@@ -1074,6 +1092,15 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        program_control_version = (
+            row["program_control_version"] if "program_control_version" in keys else 0
+        )
+        if (
+            isinstance(program_control_version, bool)
+            or not isinstance(program_control_version, int)
+            or not 0 <= program_control_version <= 2**53 - 1
+        ):
+            raise ValueError("invalid stored program_control_version")
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1145,6 +1172,7 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            program_control_version=program_control_version,
             orchestration_policy=(
                 OrchestrationPolicy.from_json(row["orchestration_policy"])
                 if "orchestration_policy" in keys and row["orchestration_policy"] else None
@@ -1253,6 +1281,130 @@ class Event:
 # Schema
 # ---------------------------------------------------------------------------
 
+_PROGRAM_CONTROL_TASK_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_program_lineage "
+    "ON tasks(id, orchestration_root_id)"
+)
+
+_PROGRAM_CONTROL_RUN_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_runs_id_task_id "
+    "ON task_runs(id, task_id)"
+)
+
+_PROGRAM_CONTROL_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS program_decisions (
+    root_id TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','selected','superseded')),
+    version INTEGER NOT NULL DEFAULT 1
+        CHECK (version >= 1 AND version <= 9007199254740991),
+    title TEXT NOT NULL, recommended_option_id TEXT NOT NULL,
+    recommendation_rationale TEXT NOT NULL, actor TEXT NOT NULL,
+    selected_option_id TEXT, created_at INTEGER NOT NULL, selected_at INTEGER,
+    PRIMARY KEY (root_id, checkpoint_id),
+    FOREIGN KEY (root_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (root_id, checkpoint_id, recommended_option_id)
+        REFERENCES program_decision_options(root_id, checkpoint_id, option_id)
+        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (root_id, checkpoint_id, selected_option_id)
+        REFERENCES program_decision_options(root_id, checkpoint_id, option_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE IF NOT EXISTS program_decision_options (
+    root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, option_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL, label TEXT NOT NULL, summary TEXT NOT NULL,
+    benefits TEXT NOT NULL, risks TEXT NOT NULL, reversibility TEXT NOT NULL,
+    security_impact TEXT NOT NULL, cost_impact TEXT NOT NULL,
+    operations_impact TEXT NOT NULL,
+    PRIMARY KEY (root_id, checkpoint_id, option_id),
+    FOREIGN KEY (root_id, checkpoint_id) REFERENCES program_decisions(root_id, checkpoint_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS program_decision_affected_nodes (
+    root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    PRIMARY KEY (root_id, checkpoint_id, node_id),
+    FOREIGN KEY (root_id, checkpoint_id) REFERENCES program_decisions(root_id, checkpoint_id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS program_hints (
+    root_id TEXT NOT NULL,
+    hint_id TEXT NOT NULL, node_id TEXT NOT NULL,
+    text TEXT NOT NULL, actor TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    expected_node_version INTEGER NOT NULL, committed_node_version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('recorded','seen','incorporated','deferred','rejected','reconcile')),
+    run_id INTEGER, claim_lock TEXT, profile TEXT, created_at INTEGER NOT NULL,
+    delivered_at INTEGER, terminal_at INTEGER, terminal_reason_code TEXT,
+    CHECK (terminal_reason_code IS NULL OR terminal_reason_code IN
+      ('incorporated','not_applicable','superseded','unsafe','invalid',
+       'stale_seen','terminal_before_delivery')),
+    CHECK (
+      (state = 'recorded' AND run_id IS NULL AND claim_lock IS NULL
+       AND profile IS NULL AND delivered_at IS NULL AND terminal_at IS NULL
+       AND terminal_reason_code IS NULL)
+      OR
+      (state = 'seen' AND run_id IS NOT NULL AND claim_lock IS NOT NULL
+       AND profile IS NOT NULL AND delivered_at IS NOT NULL
+       AND terminal_at IS NULL AND terminal_reason_code IS NULL)
+      OR
+      (state = 'incorporated' AND terminal_reason_code = 'incorporated'
+       AND run_id IS NOT NULL
+       AND claim_lock IS NOT NULL AND profile IS NOT NULL
+       AND delivered_at IS NOT NULL AND terminal_at IS NOT NULL
+      )
+      OR
+      (state = 'reconcile' AND terminal_reason_code = 'stale_seen'
+       AND run_id IS NOT NULL AND claim_lock IS NOT NULL AND profile IS NOT NULL
+       AND delivered_at IS NOT NULL AND terminal_at IS NOT NULL)
+      OR
+      (state = 'deferred' AND terminal_at IS NOT NULL AND
+       ((terminal_reason_code = 'terminal_before_delivery'
+         AND run_id IS NULL AND claim_lock IS NULL AND profile IS NULL
+         AND delivered_at IS NULL)
+        OR
+        (terminal_reason_code IN ('not_applicable','superseded')
+         AND run_id IS NOT NULL AND claim_lock IS NOT NULL AND profile IS NOT NULL
+         AND delivered_at IS NOT NULL)))
+      OR
+      (state = 'rejected' AND terminal_reason_code IN ('unsafe','invalid')
+       AND terminal_at IS NOT NULL AND run_id IS NOT NULL
+       AND claim_lock IS NOT NULL AND profile IS NOT NULL
+       AND delivered_at IS NOT NULL)
+    ),
+    PRIMARY KEY (root_id, hint_id), UNIQUE (root_id, idempotency_key),
+    FOREIGN KEY (root_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id, node_id) REFERENCES task_runs(id, task_id)
+);
+CREATE TABLE IF NOT EXISTS program_control_requests (
+    root_id TEXT NOT NULL,
+    action TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    fingerprint TEXT NOT NULL, result_json TEXT NOT NULL, created_at INTEGER NOT NULL,
+    PRIMARY KEY (root_id, action, idempotency_key),
+    FOREIGN KEY (root_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_program_decisions_node ON program_decisions(root_id, node_id, state);
+CREATE INDEX IF NOT EXISTS idx_program_affected_node ON program_decision_affected_nodes(node_id, root_id);
+CREATE INDEX IF NOT EXISTS idx_program_hints_node_state ON program_hints(root_id, node_id, state, created_at);
+"""
+
+
+def _create_program_control_schema(conn: sqlite3.Connection) -> None:
+    """Create canonical A3 objects without changing transaction nesting."""
+    conn.execute(_PROGRAM_CONTROL_TASK_INDEX_SQL)
+    if _has_canonical_task_runs_parent(conn):
+        conn.execute(_PROGRAM_CONTROL_RUN_INDEX_SQL)
+    statement = ""
+    for line in _PROGRAM_CONTROL_SCHEMA_SQL.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            statement = ""
+    if statement.strip():  # pragma: no cover - constant is complete by design
+        raise RuntimeError("incomplete program-control schema statement")
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
     id                   TEXT PRIMARY KEY,
@@ -1341,7 +1493,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    program_control_version INTEGER NOT NULL DEFAULT 0
+        CHECK (program_control_version >= 0 AND program_control_version <= 9007199254740991)
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1450,6 +1604,7 @@ _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 
 # Bounded acquire for the cross-process init lock (#36644). The original bare
 # blocking flock had no timeout, so a wedged holder blocked the dispatcher's
@@ -1478,7 +1633,9 @@ def _resolve_busy_timeout_ms() -> int:
     return DEFAULT_BUSY_TIMEOUT_MS
 
 
-def _sqlite_connect(path: Path) -> sqlite3.Connection:
+def _sqlite_connect(
+    path: Path, *, configure_busy_timeout: bool = True
+) -> sqlite3.Connection:
     """Open a Kanban SQLite connection with consistent lock waiting."""
     busy_timeout_ms = _resolve_busy_timeout_ms()
     conn = sqlite3.connect(
@@ -1489,7 +1646,8 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    if configure_busy_timeout:
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
 
 
@@ -1786,7 +1944,12 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     return candidate
 
 
-def _guard_existing_db_is_healthy(path: Path) -> None:
+def _guard_existing_db_is_healthy(
+    path: Path,
+    *,
+    corrupt_source: Optional[Path] = None,
+    connection: Optional[sqlite3.Connection] = None,
+) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
     Opens the probe in read/write mode so SQLite can recover or
@@ -1825,12 +1988,16 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     if str(resolved) in _INITIALIZED_PATHS:
         return
     reason: Optional[str] = None
+    probe = connection
+    owns_probe = probe is None
     try:
-        probe = _sqlite_connect(resolved)
+        if probe is None:
+            probe = _sqlite_connect(resolved)
         try:
             row = probe.execute("PRAGMA integrity_check").fetchone()
         finally:
-            probe.close()
+            if owns_probe:
+                probe.close()
         if not row or (row[0] or "").lower() != "ok":
             reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
     except sqlite3.OperationalError:
@@ -1840,8 +2007,246 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
-    backup = _backup_corrupt_db(resolved)
-    raise KanbanDbCorruptError(resolved, backup, reason)
+    error_path = corrupt_source.resolve() if corrupt_source is not None else resolved
+    backup = _backup_corrupt_db(error_path)
+    raise KanbanDbCorruptError(error_path, backup, reason)
+
+
+def _snapshot_signature(path: Path) -> tuple[int, ...] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (
+        stat.st_dev, stat.st_ino, stat.st_mode, stat.st_uid, stat.st_gid,
+        stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+    )
+
+
+def _copy_snapshot_file(source: Path, target: Path) -> None:
+    """Copy with best-effort no-atime access, then preserve file metadata."""
+    noatime = getattr(os, "O_NOATIME", 0)
+    flags = os.O_RDONLY | noatime
+    try:
+        source_fd = os.open(source, flags)
+    except OSError as exc:
+        portable_fallback_errors = {
+            errno.EPERM,
+            errno.EACCES,
+            errno.EINVAL,
+            getattr(errno, "EOPNOTSUPP", -1),
+            getattr(errno, "ENOTSUP", -1),
+        }
+        if not noatime or exc.errno not in portable_fallback_errors:
+            raise
+        source_fd = os.open(source, os.O_RDONLY)
+    try:
+        with os.fdopen(source_fd, "rb", closefd=False) as source_handle:
+            with target.open("wb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle, 1024 * 1024)
+    finally:
+        os.close(source_fd)
+    shutil.copystat(source, target)
+
+
+@contextlib.contextmanager
+def _stable_db_snapshot(path: Path, *, attempts: int = 3):
+    """Yield a private, bounded-consistency copy of a DB and WAL sidecars."""
+    source = path.resolve()
+    names = (source, Path(str(source) + "-wal"), Path(str(source) + "-shm"))
+    with tempfile.TemporaryDirectory(prefix="hermes-kanban-preflight-") as temp_dir:
+        target_dir = Path(temp_dir)
+        for _attempt in range(attempts):
+            before = tuple(_snapshot_signature(item) for item in names)
+            try:
+                for item, signature in zip(names, before):
+                    target = target_dir / item.name
+                    if target.exists():
+                        target.unlink()
+                    if signature is not None:
+                        _copy_snapshot_file(item, target)
+            except FileNotFoundError:
+                continue
+            after = tuple(_snapshot_signature(item) for item in names)
+            if before == after:
+                yield target_dir / source.name
+                return
+        raise RuntimeError("kanban database changed during snapshot preflight")
+
+
+class _CapabilitySnapshotRace(RuntimeError):
+    """A benign source-content race which may be retried from fresh fds."""
+
+
+def _fd_signature(fd: int) -> tuple[int, ...]:
+    stat = os.fstat(fd)
+    return (
+        stat.st_dev, stat.st_ino, stat.st_mode, stat.st_uid, stat.st_gid,
+        stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+    )
+
+
+def _fd_identity(fd: int) -> tuple[int, ...]:
+    """Stable identity for pinned directories; sibling churn is irrelevant."""
+    stat = os.fstat(fd)
+    return stat.st_dev, stat.st_ino, stat.st_mode, stat.st_uid, stat.st_gid
+
+
+def _capability_open_chain(path: Path) -> tuple[list[int], list[tuple[int, ...]]]:
+    """Pin every directory from the filesystem root through ``path``."""
+    opath = getattr(os, "O_PATH", None)
+    noatime = getattr(os, "O_NOATIME", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if (
+        opath is None
+        or noatime is None
+        or nofollow is None
+        or directory is None
+        or not _OPEN_SUPPORTS_DIR_FD
+    ):
+        raise RuntimeError("safe descriptor-relative filesystem access unavailable")
+    flags = opath | directory | nofollow | noatime
+    fds = [os.open(path.anchor, flags)]
+    signatures = [_fd_identity(fds[0])]
+    try:
+        for part in path.parts[1:]:
+            fd = os.open(part, flags, dir_fd=fds[-1])
+            fds.append(fd)
+            signatures.append(_fd_identity(fd))
+        return fds, signatures
+    except BaseException:
+        for fd in reversed(fds):
+            os.close(fd)
+        raise
+
+
+def _capability_verify_chain(path: Path, signatures: list[tuple[int, ...]]) -> None:
+    fds, current = _capability_open_chain(path)
+    try:
+        if current != signatures:
+            raise RuntimeError("database ancestor chain changed")
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def _copy_capability_fd(source_fd: int, target: Path) -> None:
+    with os.fdopen(os.dup(source_fd), "rb") as source_handle:
+        with target.open("wb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, 1024 * 1024)
+
+
+def _capability_snapshot_attempt(path: Path, target_dir: Path) -> Path:
+    noatime = getattr(os, "O_NOATIME", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if noatime is None or nofollow is None or not _OPEN_SUPPORTS_DIR_FD:
+        raise RuntimeError("safe no-atime filesystem access unavailable")
+
+    parent = path.parent
+    chain_fds, chain_signatures = _capability_open_chain(parent)
+    parent_fd = chain_fds[-1]
+    opened: dict[str, tuple[int, tuple[int, ...]]] = {}
+    flags = os.O_RDONLY | noatime | nofollow
+    names = (path.name, path.name + "-wal", path.name + "-shm")
+    try:
+        for index, name in enumerate(names):
+            try:
+                fd = os.open(name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if index == 0:
+                    raise
+                continue
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise RuntimeError("database source must not be a symlink") from exc
+                raise
+            opened[name] = (fd, _fd_signature(fd))
+
+        for name, (fd, before) in opened.items():
+            _copy_capability_fd(fd, target_dir / name)
+            if _fd_signature(fd) != before:
+                raise _CapabilitySnapshotRace("database content changed during copy")
+
+        for name in names:
+            prior = opened.get(name)
+            try:
+                verify_fd = os.open(name, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if prior is not None:
+                    raise _CapabilitySnapshotRace("database sidecar disappeared")
+                continue
+            try:
+                if prior is None:
+                    raise _CapabilitySnapshotRace("database sidecar appeared")
+                if _fd_signature(verify_fd) != prior[1]:
+                    raise _CapabilitySnapshotRace("database source was replaced")
+            finally:
+                os.close(verify_fd)
+        _capability_verify_chain(parent, chain_signatures)
+        return target_dir / path.name
+    finally:
+        for fd, _signature in opened.values():
+            os.close(fd)
+        for fd in reversed(chain_fds):
+            os.close(fd)
+
+
+@contextlib.contextmanager
+def _strict_capability_db_snapshot(path: Path, *, attempts: int = 3):
+    """Yield an atime-safe snapshot pinned entirely by directory descriptors."""
+    lexical = path.absolute()
+    with tempfile.TemporaryDirectory(prefix="hermes-kanban-capability-") as temp_dir:
+        target_dir = Path(temp_dir)
+        for attempt in range(attempts):
+            for old in target_dir.iterdir():
+                old.unlink()
+            try:
+                snapshot = _capability_snapshot_attempt(lexical, target_dir)
+            except _CapabilitySnapshotRace:
+                if attempt + 1 < attempts:
+                    continue
+                raise
+            yield snapshot
+            return
+
+
+def validate_current_program_control_schema_read_only(path: Path) -> None:
+    """Validate the complete current A3 contract without opening its source.
+
+    SQLite may write an SHM file even for a read-only WAL connection, so every
+    SQLite operation is deliberately confined to the private stable snapshot.
+    This is a capability check, not migration preflight: predecessors and
+    partially-installed schemas are rejected rather than repaired.
+    """
+    lexical = path.absolute()
+    with _strict_capability_db_snapshot(lexical) as snapshot:
+        _validate_sqlite_header(snapshot)
+        if not snapshot.exists() or snapshot.stat().st_size == 0:
+            raise RuntimeError("database is missing")
+        _guard_existing_db_is_healthy(snapshot)
+        connection = sqlite3.connect(f"{snapshot.as_uri()}?mode=ro", uri=True)
+        try:
+            connection.row_factory = sqlite3.Row
+            tasks = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
+            ).fetchone()
+            if tasks is None:
+                raise RuntimeError("tasks schema is missing")
+            version_column = next(
+                (row for row in connection.execute("PRAGMA table_xinfo(tasks)")
+                 if row["name"] == "program_control_version"),
+                None,
+            )
+            if version_column is None:
+                raise RuntimeError("tasks program-control version is missing")
+            _validate_existing_program_control_version(connection)
+            _validate_program_control_schema(connection)
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RuntimeError("program-control foreign keys are invalid")
+        finally:
+            connection.close()
+
 
 
 def connect(
@@ -1902,18 +2307,52 @@ def connect(
         return conn
 
     with _cross_process_init_lock(path):
-        # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
-        # and other invalid-header cases without opening a sqlite connection.
-        _validate_sqlite_header(path)
-        # Full integrity probe — catches corruption past the header (malformed
-        # pages, broken internal metadata). Cached per-path after first success
-        # via _INITIALIZED_PATHS so it only runs once per process per path.
-        _guard_existing_db_is_healthy(path)
+        # The first SQLite access is confined to a private snapshot. Opening a
+        # read-only WAL database can still update its SHM file, so even drift
+        # rejection must never point SQLite at the original image.
+        with _stable_db_snapshot(path) as snapshot:
+            _validate_sqlite_header(snapshot)
+            _guard_existing_db_is_healthy(snapshot, corrupt_source=path)
+            if snapshot.exists() and snapshot.stat().st_size:
+                preflight = sqlite3.connect(f"{snapshot.as_uri()}?mode=ro", uri=True)
+                try:
+                    preflight.row_factory = sqlite3.Row
+                    try:
+                        _validate_existing_program_control_schema(preflight)
+                    except sqlite3.OperationalError:
+                        raise
+                    except sqlite3.DatabaseError as exc:
+                        backup = _backup_corrupt_db(path)
+                        raise KanbanDbCorruptError(
+                            path.resolve(),
+                            backup,
+                            f"sqlite refused to validate schema: {exc}",
+                        ) from exc
+                finally:
+                    preflight.close()
+
+        # Snapshot PASS permits one connection to the original. Validate its
+        # schema first, then run integrity_check on that same open connection,
+        # before any write-producing PRAGMA closes the remaining TOCTOU window.
         resolved = str(path.resolve())
-        conn = _sqlite_connect(path)
+        conn = _sqlite_connect(path, configure_busy_timeout=False)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
+                # Revalidate after acquiring the in-process migration lock to
+                # close the gap between read-only preflight and initialization.
+                # This must remain before every write-producing PRAGMA below.
+                try:
+                    _validate_existing_program_control_schema(conn)
+                except sqlite3.OperationalError:
+                    raise
+                except sqlite3.DatabaseError as exc:
+                    backup = _backup_corrupt_db(path)
+                    raise KanbanDbCorruptError(
+                        path.resolve(), backup, f"sqlite refused to validate schema: {exc}"
+                    ) from exc
+                _guard_existing_db_is_healthy(path, connection=conn)
+                conn.execute(f"PRAGMA busy_timeout={_resolve_busy_timeout_ms()}")
                 # WAL activation can take an exclusive lock while SQLite creates the
                 # sidecar files for a fresh database. Keep it in the same process-local
                 # critical section as schema initialization so concurrent gateway
@@ -1942,7 +2381,7 @@ def connect(
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
-                    _migrate_add_optional_columns(conn)
+                    _migrate_add_optional_columns(conn, existing_program_schema_validated=True)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -2015,11 +2454,19 @@ def init_db(
     return path
 
 
-def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+def _migrate_add_optional_columns(
+    conn: sqlite3.Connection, *, existing_program_schema_validated: bool = False
+) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    # Fail before any additive ALTER/CREATE when an A3 table is already
+    # present but incompatible.  CREATE TABLE IF NOT EXISTS would otherwise
+    # conceal the drift and let later writes run against an unsafe shape.
+    if not existing_program_schema_validated:
+        _validate_existing_program_control_schema(conn)
+
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -2159,6 +2606,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "program_control_version" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "program_control_version",
+            "program_control_version INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (program_control_version >= 0 AND program_control_version <= 9007199254740991)",
+        )
+
     if "orchestration_policy" not in cols:
         _add_column_if_missing(
             conn, "tasks", "orchestration_policy", "orchestration_policy TEXT"
@@ -2287,7 +2741,517 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    # Rebuild legacy parent tables before creating program_hints. SQLite
+    # rewrites child FK targets during ALTER TABLE ... RENAME, so creating A3
+    # first would strand its run FK on ``task_runs_legacy`` and silently drop
+    # the required unique parent index when that table is removed.
     _rebuild_drifted_tables(conn)
+
+    # Phase2 shipped this table with the final columns/keys but before the
+    # lifecycle-pair CHECK. Upgrade that one exact predecessor in isolation.
+    _migrate_phase2_program_hints(conn)
+
+    # Direct callers of this legacy helper do not run aggregate SCHEMA_SQL.
+    # Install canonical A3 only after all parent migrations, then require the
+    # exact complete schema (including named indexes) with no rebuild path.
+    _create_program_control_schema(conn)
+    _validate_program_control_schema(conn)
+
+
+_PROGRAM_CONTROL_COLUMNS = {
+    "program_decisions": {"root_id", "checkpoint_id", "node_id", "state", "version", "title",
+                          "recommended_option_id", "recommendation_rationale", "actor",
+                          "selected_option_id", "created_at", "selected_at"},
+    "program_decision_options": {"root_id", "checkpoint_id", "option_id", "ordinal", "label",
+                                 "summary", "benefits", "risks", "reversibility", "security_impact",
+                                 "cost_impact", "operations_impact"},
+    "program_decision_affected_nodes": {"root_id", "checkpoint_id", "node_id"},
+    "program_hints": {"root_id", "hint_id", "node_id", "text", "actor", "idempotency_key",
+                      "expected_node_version", "committed_node_version", "state", "run_id",
+                      "claim_lock", "profile", "created_at", "delivered_at", "terminal_at",
+                      "terminal_reason_code"},
+    "program_control_requests": {"root_id", "action", "idempotency_key", "fingerprint",
+                                 "result_json", "created_at"},
+}
+
+_PROGRAM_CONTROL_VERSION_CHECK = (
+    "program_control_version >= 0 and "
+    "program_control_version <= 9007199254740991"
+)
+
+
+def _has_canonical_task_runs_parent(conn: sqlite3.Connection) -> bool:
+    """Whether task_runs has the production parent key used by hint lineage."""
+    columns = {
+        row["name"]: row for row in conn.execute("PRAGMA table_xinfo(task_runs)")
+    }
+    run_id = columns.get("id")
+    task_id = columns.get("task_id")
+    return bool(
+        run_id is not None
+        and run_id["type"].casefold() == "integer"
+        and run_id["pk"] == 1
+        and task_id is not None
+        and task_id["type"].casefold() == "text"
+        and task_id["notnull"] == 1
+    )
+
+
+def _validate_existing_program_control_version(conn: sqlite3.Connection) -> None:
+    """Fail closed when the additive task version column already drifted."""
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+    ).fetchone()
+    if table is None:
+        return
+    column = next((row for row in conn.execute("PRAGMA table_xinfo(tasks)")
+                   if row["name"] == "program_control_version"), None)
+    if column is None:
+        return
+    normalized_sql = _normalize_schema_sql(table[0]) or ""
+    checks = [
+        match.group(1).strip()
+        for match in re.finditer(r"\bcheck\s*\(([^()]*)\)", normalized_sql)
+        if "program_control_version" in match.group(1)
+    ]
+    valid = (
+        column["type"].casefold() == "integer"
+        and column["notnull"] == 1
+        and _normalize_schema_sql(column["dflt_value"]) == "0"
+        and checks == [_PROGRAM_CONTROL_VERSION_CHECK]
+    )
+    if not valid:
+        raise RuntimeError(
+            "tasks.program_control_version schema is incomplete or incompatible"
+        )
+
+
+def _normalize_schema_sql(sql: str | None) -> str | None:
+    """Normalize insignificant formatting while retaining every DDL contract."""
+    return None if sql is None else " ".join(sql.casefold().split())
+
+
+def _program_control_shape(conn: sqlite3.Connection, table: str) -> tuple:
+    """Return a deterministic signature including constraints and named indexes."""
+    table_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    table_sql = _normalize_schema_sql(table_sql_row[0] if table_sql_row else None)
+    columns = tuple(
+        (row["cid"], row["name"], row["type"].casefold(), row["notnull"],
+         _normalize_schema_sql(row["dflt_value"]), row["pk"], row["hidden"])
+        for row in conn.execute(f"PRAGMA table_xinfo({table})")
+    )
+    foreign_keys = tuple(tuple(row) for row in conn.execute(
+        f"PRAGMA foreign_key_list({table})"
+    ))
+    indexes = []
+    for row in conn.execute(f"PRAGMA index_list({table})"):
+        index_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (row["name"],)
+        ).fetchone()
+        indexes.append((row["name"], row["unique"], row["origin"], row["partial"],
+                        tuple(tuple(item) for item in conn.execute(
+                            f"PRAGMA index_xinfo({row['name']})"
+                        )), _normalize_schema_sql(index_sql[0] if index_sql else None)))
+    return table_sql, columns, foreign_keys, tuple(indexes)
+
+
+def _canonical_program_control_shapes() -> dict[str, tuple]:
+    reference = sqlite3.connect(":memory:")
+    reference.row_factory = sqlite3.Row
+    reference.executescript(
+        "CREATE TABLE tasks(id TEXT PRIMARY KEY, orchestration_root_id TEXT);"
+        "CREATE TABLE task_runs(id INTEGER PRIMARY KEY, task_id TEXT NOT NULL);"
+    )
+    _create_program_control_schema(reference)
+    return {table: _program_control_shape(reference, table)
+            for table in _PROGRAM_CONTROL_COLUMNS}
+
+
+_PHASE2_PROGRAM_HINTS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS program_hints (
+    root_id TEXT NOT NULL,
+    hint_id TEXT NOT NULL, node_id TEXT NOT NULL,
+    text TEXT NOT NULL, actor TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    expected_node_version INTEGER NOT NULL, committed_node_version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('recorded','seen','incorporated','deferred','rejected','reconcile')),
+    run_id INTEGER, claim_lock TEXT, profile TEXT, created_at INTEGER NOT NULL,
+    delivered_at INTEGER, terminal_at INTEGER, terminal_reason_code TEXT,
+    PRIMARY KEY (root_id, hint_id), UNIQUE (root_id, idempotency_key),
+    FOREIGN KEY (root_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id, node_id) REFERENCES task_runs(id, task_id)
+)
+"""
+
+
+def _phase2_program_hints_shape() -> tuple:
+    reference = sqlite3.connect(":memory:")
+    reference.row_factory = sqlite3.Row
+    reference.executescript(
+        "CREATE TABLE tasks(id TEXT PRIMARY KEY, orchestration_root_id TEXT);"
+        "CREATE TABLE task_runs(id INTEGER PRIMARY KEY, task_id TEXT NOT NULL);"
+        + _PHASE2_PROGRAM_HINTS_SCHEMA_SQL
+        + ";CREATE INDEX IF NOT EXISTS idx_program_hints_node_state "
+          "ON program_hints(root_id, node_id, state, created_at);"
+    )
+    shape = _program_control_shape(reference, "program_hints")
+    reference.close()
+    return shape
+
+
+def _program_hints_is_phase2(conn: sqlite3.Connection) -> bool:
+    return _program_control_shape(conn, "program_hints") == _phase2_program_hints_shape()
+
+
+def _validate_phase2_program_hint_rows(conn: sqlite3.Connection) -> None:
+    invalid = conn.execute(
+        "SELECT 1 FROM program_hints WHERE state <> 'recorded' "
+        "OR run_id IS NOT NULL OR claim_lock IS NOT NULL OR profile IS NOT NULL "
+        "OR delivered_at IS NOT NULL OR terminal_at IS NOT NULL "
+        "OR terminal_reason_code IS NOT NULL LIMIT 1"
+    ).fetchone()
+    if invalid is not None:
+        raise RuntimeError("program_hints Phase2 rows are incompatible with Phase3A")
+
+
+def _validate_phase2_program_hints_has_no_inbound_foreign_keys(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reject a rename migration that would retarget external child FKs."""
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+    ).fetchall()
+    for row in tables:
+        table = row["name"]
+        quoted_table = '"' + table.replace('"', '""') + '"'
+        if any(
+            foreign_key["table"].casefold() == "program_hints"
+            for foreign_key in conn.execute(f"PRAGMA foreign_key_list({quoted_table})")
+        ):
+            raise RuntimeError(
+                "program_hints Phase2 migration blocked by inbound foreign key"
+            )
+
+
+def _validate_phase2_program_hints_temporary_name_available(
+    conn: sqlite3.Connection,
+) -> None:
+    collision = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name=? LIMIT 1",
+        ("program_hints_phase2",),
+    ).fetchone()
+    if collision is not None:
+        raise RuntimeError(
+            "program_hints Phase2 migration blocked by existing "
+            "program_hints_phase2 schema object"
+        )
+
+
+def _sqlite_sql_identifier_tokens(sql: str) -> tuple[str, ...]:
+    """Extract SQLite identifiers while excluding literals and comments.
+
+    This is intentionally a small lexer, not a SQL parser.  Rename safety only
+    needs exact identifier tokens, but substring matching is unsafe because it
+    confuses string/comment canaries and names such as ``my_program_hints``.
+    SQLite's single-quote compatibility is honored only where the grammar
+    requires a table name.
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        raise ValueError("missing SQLite schema SQL")
+    lexical_tokens = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char.isspace():
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end < 0:
+                raise ValueError("unterminated SQLite block comment")
+            index = end + 2
+            continue
+        if char == "'":
+            index += 1
+            value = []
+            while index < length:
+                if sql[index] != "'":
+                    value.append(sql[index])
+                    index += 1
+                elif index + 1 < length and sql[index + 1] == "'":
+                    value.append("'")
+                    index += 2
+                else:
+                    index += 1
+                    lexical_tokens.append(("single", "".join(value).casefold()))
+                    break
+            else:
+                raise ValueError("unterminated SQLite string literal")
+            continue
+        if char in {'"', "`", "["}:
+            closing = "]" if char == "[" else char
+            index += 1
+            value = []
+            while index < length:
+                if sql[index] != closing:
+                    value.append(sql[index])
+                    index += 1
+                elif closing != "]" and index + 1 < length and sql[index + 1] == closing:
+                    value.append(closing)
+                    index += 2
+                else:
+                    index += 1
+                    lexical_tokens.append(("identifier", "".join(value).casefold()))
+                    break
+            else:
+                raise ValueError("unterminated SQLite quoted identifier")
+            continue
+        if char.isalpha() or char == "_" or ord(char) >= 128:
+            start = index
+            index += 1
+            while index < length and (
+                sql[index].isalnum() or sql[index] in {"_", "$"} or ord(sql[index]) >= 128
+            ):
+                index += 1
+            lexical_tokens.append(("identifier", sql[start:index].casefold()))
+            continue
+        if char in {".", "(", ")", ",", ";"}:
+            lexical_tokens.append(("punctuation", char))
+        index += 1
+
+    identifiers = [
+        value for kind, value in lexical_tokens if kind == "identifier"
+    ]
+    conflict_actions = {"rollback", "abort", "fail", "ignore", "replace"}
+    for token_index, (kind, value) in enumerate(lexical_tokens):
+        if kind != "single":
+            continue
+        previous = token_index - 1
+        while previous >= 0 and lexical_tokens[previous] == ("punctuation", "("):
+            previous -= 1
+        if previous >= 1 and lexical_tokens[previous] == ("punctuation", "."):
+            previous -= 2  # Skip the schema identifier and its separator.
+            while previous >= 0 and lexical_tokens[previous] == ("punctuation", "("):
+                previous -= 1
+        context = lexical_tokens[previous] if previous >= 0 else None
+        is_table_context = context in {
+            ("identifier", "from"),
+            ("identifier", "join"),
+            ("identifier", "into"),
+            ("identifier", "update"),
+        }
+        if (
+            not is_table_context
+            and context is not None
+            and context[0] == "identifier"
+            and context[1] in conflict_actions
+            and previous >= 2
+        ):
+            is_table_context = (
+                lexical_tokens[previous - 1] == ("identifier", "or")
+                and lexical_tokens[previous - 2] == ("identifier", "update")
+            )
+        if is_table_context:
+            identifiers.append(value)
+    return tuple(identifiers)
+
+
+def _validate_phase2_program_hints_has_no_external_sql_dependencies(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reject views/triggers whose owner or SQL depends on the renamed table."""
+    objects = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE type IN ('view','trigger')"
+    ).fetchall()
+    for schema_object in objects:
+        try:
+            identifiers = _sqlite_sql_identifier_tokens(schema_object["sql"])
+        except ValueError as exc:
+            raise RuntimeError(
+                "program_hints Phase2 migration blocked by malformed external "
+                "view or trigger"
+            ) from exc
+        trigger_owns_table = (
+            schema_object["type"] == "trigger"
+            and isinstance(schema_object["tbl_name"], str)
+            and schema_object["tbl_name"].casefold() == "program_hints"
+        )
+        if trigger_owns_table or "program_hints" in identifiers:
+            raise RuntimeError(
+                "program_hints Phase2 migration blocked by external view or trigger"
+            )
+
+
+def _validate_program_hints_phase2_removed(conn: sqlite3.Connection) -> None:
+    """Prove the temporary predecessor name did not leak before commit."""
+    legacy = "program_hints_phase2"
+    for schema_object in conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master"
+    ):
+        if schema_object["name"].casefold() == legacy:
+            raise RuntimeError("program_hints Phase2 migration left a legacy object")
+        if (
+            schema_object["type"] == "trigger"
+            and isinstance(schema_object["tbl_name"], str)
+            and schema_object["tbl_name"].casefold() == legacy
+        ):
+            raise RuntimeError("program_hints Phase2 migration left a legacy trigger owner")
+        if schema_object["sql"] is not None:
+            try:
+                identifiers = _sqlite_sql_identifier_tokens(schema_object["sql"])
+            except ValueError as exc:
+                raise RuntimeError(
+                    "program_hints Phase2 migration could not verify schema SQL"
+                ) from exc
+            if legacy in identifiers:
+                raise RuntimeError(
+                    "program_hints Phase2 migration left a legacy SQL reference"
+                )
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+    for row in tables:
+        table = row["name"]
+        quoted_table = '"' + table.replace('"', '""') + '"'
+        if any(
+            foreign_key["table"].casefold() == legacy
+            for foreign_key in conn.execute(f"PRAGMA foreign_key_list({quoted_table})")
+        ):
+            raise RuntimeError("program_hints Phase2 migration left a legacy foreign key")
+
+
+def _program_control_statement(prefix: str) -> str:
+    statement = ""
+    for line in _PROGRAM_CONTROL_SCHEMA_SQL.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.lstrip().casefold().startswith(prefix.casefold()):
+                return statement
+            statement = ""
+    raise RuntimeError(f"missing canonical schema statement: {prefix}")
+
+
+def _migrate_phase2_program_hints(conn: sqlite3.Connection) -> None:
+    if not _program_hints_is_phase2(conn):
+        return
+    _validate_phase2_program_hint_rows(conn)
+    _validate_phase2_program_hints_has_no_inbound_foreign_keys(conn)
+    _validate_phase2_program_hints_temporary_name_available(conn)
+    _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
+    columns = tuple(row["name"] for row in conn.execute("PRAGMA table_xinfo(program_hints)"))
+    quoted_columns = ", ".join(f'"{column}"' for column in columns)
+    with write_txn(conn):
+        # Recheck under the write lock, closing the preflight-to-migration gap.
+        if not _program_hints_is_phase2(conn):
+            raise RuntimeError("program_hints schema changed during Phase2 migration")
+        _validate_phase2_program_hint_rows(conn)
+        _validate_phase2_program_hints_has_no_inbound_foreign_keys(conn)
+        _validate_phase2_program_hints_temporary_name_available(conn)
+        _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
+        conn.execute("ALTER TABLE program_hints RENAME TO program_hints_phase2")
+        conn.execute("DROP INDEX idx_program_hints_node_state")
+        conn.execute(_program_control_statement("CREATE TABLE IF NOT EXISTS program_hints"))
+        conn.execute(
+            f"INSERT INTO program_hints ({quoted_columns}) "
+            f"SELECT {quoted_columns} FROM program_hints_phase2"
+        )
+        conn.execute("DROP TABLE program_hints_phase2")
+        conn.execute(_program_control_statement(
+            "CREATE INDEX IF NOT EXISTS idx_program_hints_node_state"
+        ))
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("program_hints Phase2 migration violated foreign keys")
+        _validate_program_hints_phase2_removed(conn)
+
+
+def _program_control_named_indexes(conn: sqlite3.Connection) -> tuple:
+    names = ("idx_tasks_program_lineage", "idx_program_decisions_node",
+             "idx_program_affected_node", "idx_program_hints_node_state")
+    if _has_canonical_task_runs_parent(conn):
+        names += ("idx_task_runs_id_task_id",)
+    result = []
+    for name in names:
+        row = conn.execute(
+            "SELECT tbl_name, sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
+        ).fetchone()
+        if row is None:
+            result.append((name, None, None, ()))
+        else:
+            result.append((name, row["tbl_name"], _normalize_schema_sql(row["sql"]),
+                           tuple(info["name"] for info in conn.execute(
+                               f"PRAGMA index_info({name})"
+                           ))))
+    return tuple(result)
+
+
+def _canonical_program_control_named_indexes(*, include_run_parent: bool = True) -> tuple:
+    reference = sqlite3.connect(":memory:")
+    reference.row_factory = sqlite3.Row
+    reference.execute(
+        "CREATE TABLE tasks(id TEXT PRIMARY KEY, orchestration_root_id TEXT)"
+    )
+    if include_run_parent:
+        reference.execute(
+            "CREATE TABLE task_runs(id INTEGER PRIMARY KEY, task_id TEXT NOT NULL)"
+        )
+    _create_program_control_schema(reference)
+    return _program_control_named_indexes(reference)
+
+
+def _validate_program_control_table(
+    conn: sqlite3.Connection, table: str, *, allow_phase2_hints: bool = False
+) -> None:
+    actual = _program_control_shape(conn, table)
+    expected = _canonical_program_control_shapes()[table]
+    if actual != expected and not (
+        allow_phase2_hints
+        and table == "program_hints"
+        and actual == _phase2_program_hints_shape()
+    ):
+        raise RuntimeError(f"{table} schema is incomplete or incompatible")
+
+
+def _validate_program_control_schema(conn: sqlite3.Connection) -> None:
+    """Fail closed on partially-created A3 tables instead of losing rows."""
+    for table in _PROGRAM_CONTROL_COLUMNS:
+        _validate_program_control_table(conn, table)
+    has_run_parent = _has_canonical_task_runs_parent(conn)
+    if _program_control_named_indexes(conn) != _canonical_program_control_named_indexes(
+        include_run_parent=has_run_parent
+    ):
+        raise RuntimeError("program-control named index schema is incomplete or incompatible")
+
+
+def _validate_existing_program_control_schema(conn: sqlite3.Connection) -> None:
+    """Validate only A3 tables already present, before indexes touch them."""
+    _validate_existing_program_control_version(conn)
+    existing = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    for table in _PROGRAM_CONTROL_COLUMNS:
+        if table not in existing:
+            continue
+        _validate_program_control_table(conn, table, allow_phase2_hints=True)
+        if table == "program_hints" and _program_hints_is_phase2(conn):
+            _validate_phase2_program_hint_rows(conn)
+            _validate_phase2_program_hints_has_no_inbound_foreign_keys(conn)
+            _validate_phase2_program_hints_temporary_name_available(conn)
+            _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
+    if existing.intersection(_PROGRAM_CONTROL_COLUMNS) and (
+        _program_control_named_indexes(conn) != _canonical_program_control_named_indexes(
+            include_run_parent=_has_canonical_task_runs_parent(conn)
+        )
+    ):
+        raise RuntimeError("program-control named index schema is incomplete or incompatible")
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -3552,9 +4516,20 @@ def _end_run(
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
+    terminal = conn.execute(
+        "SELECT status IN ('done','blocked','archived') FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    terminal_task = bool(terminal and terminal[0])
     if not row or not row["current_run_id"]:
+        _finalize_program_hints_locked(
+            conn, task_id, run_id=None, terminal_task=terminal_task, now=now,
+        )
         return None
     run_id = int(row["current_run_id"])
+    _finalize_program_hints_locked(
+        conn, task_id, run_id=run_id, terminal_task=terminal_task, now=now,
+    )
     conn.execute(
         """
         UPDATE task_runs
@@ -3584,6 +4559,53 @@ def _end_run(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
     return run_id
+
+
+def _append_hint_event_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    hint_id: str,
+    state: str,
+    *,
+    run_id: Optional[int] = None,
+    reason_code: Optional[str] = None,
+) -> None:
+    """Emit lifecycle metadata only; hint authority and prose stay private."""
+    payload = {"hint_id": hint_id, "node_id": task_id, "run_id": run_id,
+               "state": state, "reason_code": reason_code}
+    _append_event(conn, task_id, "hint_" + state, payload, run_id=run_id)
+
+
+def _finalize_program_hints_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    terminal_task: bool,
+    now: Optional[int] = None,
+) -> int:
+    """Close undelivered/delivered hints during termination; caller owns txn."""
+    terminal_at = int(time.time()) if now is None else now
+    rows = conn.execute(
+        "SELECT root_id,hint_id,state,run_id FROM program_hints WHERE node_id=? "
+        "AND (state='seen' OR (? AND state='recorded')) ORDER BY created_at,hint_id",
+        (task_id, terminal_task),
+    ).fetchall()
+    changed = 0
+    for row in rows:
+        target = "deferred" if row["state"] == "recorded" else "reconcile"
+        reason = "terminal_before_delivery" if target == "deferred" else "stale_seen"
+        cur = conn.execute(
+            "UPDATE program_hints SET state=?,terminal_at=?,terminal_reason_code=? "
+            "WHERE root_id=? AND node_id=? AND hint_id=? AND state=?",
+            (target, terminal_at, reason, row["root_id"], task_id,
+             row["hint_id"], row["state"]),
+        )
+        if cur.rowcount:
+            _append_hint_event_locked(conn, task_id, row["hint_id"], target,
+                                      run_id=row["run_id"], reason_code=reason)
+            changed += 1
+    return changed
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
@@ -3686,8 +4708,96 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+_PENDING_PROGRAM_DECISION_EXCLUSION_SQL = (
+    "AND NOT EXISTS ("
+    " SELECT 1 FROM program_decision_affected_nodes a "
+    " JOIN program_decisions d ON d.root_id=a.root_id "
+    "  AND d.checkpoint_id=a.checkpoint_id "
+    " WHERE a.node_id=tasks.id AND d.state='pending'"
+    ") "
+)
+
+
+def _has_pending_program_decision_locked(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Return whether a pending decision gates ``task_id``.
+
+    Callers hold the transaction that protects their subsequent state change.
+    ``idx_program_affected_node`` makes the affected-node lookup selective;
+    the decision primary key resolves the joined checkpoint.
+    """
+    return conn.execute(
+        "SELECT 1 FROM program_decision_affected_nodes a "
+        "JOIN program_decisions d ON d.root_id=a.root_id "
+        "AND d.checkpoint_id=a.checkpoint_id "
+        "WHERE a.node_id=? AND d.state='pending' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
+def _recompute_ready_locked(
+    conn: sqlite3.Connection,
+    failure_limit: Optional[int] = None,
+    task_ids: Optional[Iterable[str]] = None,
+) -> int:
+    """Locked implementation of dependency-ready promotion.
+
+    This helper never opens or commits a transaction, allowing decision
+    selection and ready release to remain one atomic mutation.
+    """
+    if failure_limit is None:
+        failure_limit = DEFAULT_FAILURE_LIMIT
+    params: list[Any] = []
+    where = "status IN ('todo', 'blocked')"
+    if task_ids is not None:
+        ids = list(dict.fromkeys(task_ids))
+        if not ids:
+            return 0
+        where += f" AND id IN ({','.join('?' for _ in ids)})"
+        params.extend(ids)
+    promoted = 0
+    todo_rows = conn.execute(
+        "SELECT id, status, consecutive_failures, max_retries "
+        f"FROM tasks WHERE {where}", params,
+    ).fetchall()
+    for row in todo_rows:
+        task_id = row["id"]
+        cur_status = row["status"]
+        if _has_pending_program_decision_locked(conn, task_id):
+            continue
+        if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            continue
+        parents = conn.execute(
+            "SELECT t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ?", (task_id,),
+        ).fetchall()
+        if not all(p["status"] in ("done", "archived") for p in parents):
+            continue
+        if cur_status == "blocked":
+            failures = int(row["consecutive_failures"] or 0)
+            task_limit = row["max_retries"]
+            effective_limit = int(task_limit) if task_limit is not None else int(failure_limit)
+            if failures >= effective_limit:
+                continue
+            changed = conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'blocked'",
+                (task_id,),
+            )
+        else:
+            changed = conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                (task_id,),
+            )
+        if changed.rowcount == 1:
+            _append_event(conn, task_id, "promoted", None)
+            promoted += 1
+    return promoted
+
+
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection, failure_limit: Optional[int] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -3717,60 +4827,8 @@ def recompute_ready(
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
     """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
-    promoted = 0
     with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
-        ).fetchall()
-        for row in todo_rows:
-            task_id = row["id"]
-            cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
-                if cur_status == "blocked":
-                    # Don't auto-recover tasks that have hit the
-                    # circuit-breaker failure limit.  Without this
-                    # guard, a task that repeatedly exhausts its
-                    # iteration budget would cycle forever:
-                    # block → auto-recover → respawn → budget
-                    # exhausted → block → …  The counter must also
-                    # be preserved so the breaker can accumulate
-                    # across recovery cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
-                    )
-                    if failures >= effective_limit:
-                        continue
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
-                _append_event(conn, task_id, "promoted", None)
-                promoted += 1
-    return promoted
+        return _recompute_ready_locked(conn, failure_limit=failure_limit)
 
 
 # ---------------------------------------------------------------------------
@@ -3820,6 +4878,10 @@ def _block_expired_program_task(
             conn, task_id, outcome="timed_out", status="timed_out",
             error=reason, metadata={"reason": reason},
         )
+    else:
+        _finalize_program_hints_locked(
+            conn, task_id, run_id=None, terminal_task=True, now=now,
+        )
     if cur.rowcount == 1:
         _append_event(conn, task_id, "blocked", {"reason": reason})
     return cur.rowcount == 1
@@ -3859,6 +4921,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _has_pending_program_decision_locked(conn, task_id):
+            return None
         if not _admit_program_run(conn, task_id, now):
             return None
         # Structural invariant: never transition ready -> running while any
@@ -3895,6 +4959,10 @@ def claim_task(
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
+            _finalize_program_hints_locked(
+                conn, task_id, run_id=int(stale["current_run_id"]),
+                terminal_task=False, now=now,
+            )
             conn.execute(
                 """
                 UPDATE task_runs
@@ -3990,6 +5058,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _has_pending_program_decision_locked(conn, task_id):
+            return None
         if not _admit_program_run(conn, task_id, now):
             return None
         cur = conn.execute(
@@ -5560,6 +6630,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
+            _finalize_program_hints_locked(
+                conn, task_id, run_id=int(stale["current_run_id"]),
+                terminal_task=False, now=now,
+            )
             conn.execute(
                 """
                 UPDATE task_runs
@@ -7556,6 +8630,10 @@ def _record_task_failure(
                         "limit_source": limit_source,
                     },
                 )
+            else:
+                _finalize_program_hints_locked(
+                    conn, task_id, run_id=None, terminal_task=True,
+                )
             payload = {
                 "failures": failures,
                 "effective_limit": effective_limit,
@@ -7818,7 +8896,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        + _PENDING_PROGRAM_DECISION_EXCLUSION_SQL
     ).fetchall()
     if not rows:
         return False
@@ -7844,7 +8923,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        + _PENDING_PROGRAM_DECISION_EXCLUSION_SQL
     ).fetchall()
     if not rows:
         return False
@@ -8013,6 +9093,8 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        + _PENDING_PROGRAM_DECISION_EXCLUSION_SQL
+        +
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
@@ -8255,6 +9337,8 @@ def _dispatch_once_locked(
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
+        + _PENDING_PROGRAM_DECISION_EXCLUSION_SQL
+        +
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
