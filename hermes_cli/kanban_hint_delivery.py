@@ -62,7 +62,7 @@ def sanitize_hinted_turn_result(value: Any, batch: Sequence[dict[str, str]]) -> 
     partial = type(value) is dict and value.get("partial") is True
     if not failed and not partial:
         return {"final_response": HINTED_TURN_SUCCESS}
-    sanitized = {
+    sanitized: dict[str, Any] = {
         "final_response": HINTED_TURN_FAILURE,
         "error": {
             "code": HINTED_TURN_ERROR_CODE,

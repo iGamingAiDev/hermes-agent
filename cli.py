@@ -16523,11 +16523,9 @@ def main(
                         # continuation session. The exit line below reports
                         # session_id to stderr for automation wrappers; without
                         # this sync it would point at the ended parent.
-                        if (
-                            getattr(cli.agent, "session_id", None)
-                            and cli.agent.session_id != cli.session_id
-                        ):
-                            cli.session_id = cli.agent.session_id
+                        agent_session_id = getattr(cli.agent, "session_id", None)
+                        if agent_session_id and agent_session_id != cli.session_id:
+                            cli.session_id = agent_session_id
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
                         # interactive CLI path. Write to stderr so piped stdout

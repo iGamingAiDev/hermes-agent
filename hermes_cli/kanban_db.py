@@ -4732,7 +4732,7 @@ def _has_pending_program_decision_locked(
 
 def _recompute_ready_locked(
     conn: sqlite3.Connection,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
     task_ids: Optional[Iterable[str]] = None,
 ) -> int:
     """Locked implementation of dependency-ready promotion.
@@ -4791,7 +4791,7 @@ def _recompute_ready_locked(
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection, failure_limit: Optional[int] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 

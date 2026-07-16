@@ -78,7 +78,10 @@ def _ancestor_stats(path: Path):
     for part in path.parent.parts[1:]:
         current /= part
         ancestors.append(current)
-    return {ancestor: ancestor.stat() for ancestor in ancestors}
+    # Parallel pytest workers legitimately create/remove siblings under shared
+    # ancestors such as /tmp, changing mtime/ctime/nlink. The capability
+    # contract is specifically no-atime access, so assert that invariant only.
+    return {ancestor: ancestor.stat().st_atime_ns for ancestor in ancestors}
 
 
 def test_capabilities_exact_repeatable_read_only_success(current_board, capsys):
