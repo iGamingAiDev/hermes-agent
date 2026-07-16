@@ -57,6 +57,99 @@ def test_poll_order_bounds_ack_idempotency_and_event_privacy(active):
     assert "secret" not in json.dumps(payloads)
 
 
+def test_ack_batch_rolls_back_updates_and_events_on_second_row_abort(active):
+    conn, task, run = active
+    _hint(conn, task, "1")
+    _hint(conn, task, "2")
+    batch = pc.poll_hints(conn, task_id=task, run_id=run,
+                          claim_lock="host:claim", profile="worker")
+    before_events = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+    conn.execute(
+        "CREATE TRIGGER abort_second_ack BEFORE UPDATE OF state ON program_hints "
+        "WHEN OLD.hint_id='h_2' AND NEW.state='incorporated' "
+        "BEGIN SELECT RAISE(ABORT, 'second ack aborted'); END"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="second ack aborted"):
+        pc.ack_hints(conn, hint_ids=[item["hint_id"] for item in batch],
+                     task_id=task, run_id=run, claim_lock="host:claim", profile="worker",
+                     state="incorporated", reason_code="incorporated")
+    assert dict(conn.execute("SELECT hint_id,state FROM program_hints")) == {
+        "h_1": "seen", "h_2": "seen"
+    }
+    assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == before_events
+
+
+def test_ack_batch_rejects_mixed_replay_duplicates_bool_and_stale_without_mutation(active):
+    conn, task, run = active
+    for suffix in ("1", "2"):
+        _hint(conn, task, suffix)
+    pc.poll_hints(conn, task_id=task, run_id=run, claim_lock="host:claim", profile="worker")
+    pc.ack_hint(conn, hint_id="h_1", task_id=task, run_id=run,
+                claim_lock="host:claim", profile="worker",
+                state="incorporated", reason_code="incorporated")
+    snapshot = list(conn.execute("SELECT hint_id,state FROM program_hints ORDER BY hint_id"))
+    events = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+    for ids, expected in [(["h_1", "h_2"], "hint_ack_conflict"),
+                          (["h_2", "h_2"], "invalid_hint_ids"),
+                          ([True], "invalid_hint_ids")]:
+        with pytest.raises(pc.ProgramControlError, match=expected):
+            pc.ack_hints(conn, hint_ids=ids, task_id=task, run_id=run,
+                         claim_lock="host:claim", profile="worker",
+                         state="incorporated", reason_code="incorporated")
+    assert list(conn.execute("SELECT hint_id,state FROM program_hints ORDER BY hint_id")) == snapshot
+    assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == events
+
+    conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (task,))
+    with pytest.raises(pc.ProgramControlError, match="stale_hint_authority"):
+        pc.ack_hints(conn, hint_ids=["h_2"], task_id=task, run_id=run,
+                     claim_lock="host:claim", profile="worker",
+                     state="incorporated", reason_code="incorporated")
+    assert conn.execute("SELECT state FROM program_hints WHERE hint_id='h_2'").fetchone()[0] == "seen"
+
+
+def test_ack_batch_exact_full_replay_is_idempotent_without_events(active):
+    conn, task, run = active
+    for suffix in ("1", "2"):
+        _hint(conn, task, suffix)
+    batch = pc.poll_hints(conn, task_id=task, run_id=run,
+                          claim_lock="host:claim", profile="worker")
+    ids = [item["hint_id"] for item in batch]
+    assert pc.ack_hints(conn, hint_ids=ids, task_id=task, run_id=run,
+                        claim_lock="host:claim", profile="worker",
+                        state="incorporated", reason_code="incorporated")
+    events = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+    assert pc.ack_hints(conn, hint_ids=ids, task_id=task, run_id=run,
+                        claim_lock="host:claim", profile="worker",
+                        state="incorporated", reason_code="incorporated")
+    assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == events
+
+
+@pytest.mark.parametrize("invalidate", ["expiry", "completion", "reclaim"])
+def test_ack_exact_batch_replay_precedes_stale_authority_checks(active, invalidate):
+    conn, task, run = active
+    for suffix in ("1", "2"):
+        _hint(conn, task, suffix)
+    ids = [item["hint_id"] for item in pc.poll_hints(
+        conn, task_id=task, run_id=run, claim_lock="host:claim", profile="worker"
+    )]
+    assert pc.ack_hints(conn, hint_ids=ids, task_id=task, run_id=run,
+                        claim_lock="host:claim", profile="worker",
+                        state="incorporated", reason_code="incorporated")
+    if invalidate == "expiry":
+        conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (task,))
+    elif invalidate == "completion":
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task,))
+    else:
+        assert kb.reclaim_task(conn, task, signal_fn=lambda *_: None)
+    snapshot = list(conn.execute("SELECT hint_id,state,terminal_reason_code FROM program_hints ORDER BY hint_id"))
+    events = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+    assert pc.ack_hints(conn, hint_ids=ids, task_id=task, run_id=run,
+                        claim_lock="host:claim", profile="worker",
+                        state="incorporated", reason_code="incorporated")
+    assert list(conn.execute("SELECT hint_id,state,terminal_reason_code FROM program_hints ORDER BY hint_id")) == snapshot
+    assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0] == events
+
+
 def test_reclaim_reconciles_seen_and_preserves_recorded(active):
     conn, task, run = active
     _hint(conn, task, "1")
@@ -67,7 +160,7 @@ def test_reclaim_reconciles_seen_and_preserves_recorded(active):
     assert kb.reclaim_task(conn, task, signal_fn=lambda *_: None)
     states = dict(conn.execute("SELECT hint_id,state FROM program_hints"))
     assert states == {"h_1": "reconcile", "h_2": "reconcile", "h_3": "recorded"}
-    with pytest.raises(pc.ProgramControlError, match="stale_hint_authority"):
+    with pytest.raises(pc.ProgramControlError, match="hint_ack_conflict"):
         pc.ack_hint(conn, hint_id="h_1", task_id=task, run_id=run,
                     claim_lock="host:claim", profile="worker",
                     state="incorporated", reason_code="incorporated")

@@ -462,10 +462,21 @@ def poll_hints(conn: sqlite3.Connection, *, task_id: Any, run_id: Any,
         return [{"hint_id": row["hint_id"], "text": row["text"]} for row in selected]
 
 
-def ack_hint(conn: sqlite3.Connection, *, hint_id: Any, task_id: Any, run_id: Any,
-             claim_lock: Any, profile: Any, state: Any, reason_code: Any) -> bool:
-    """Terminal CAS acknowledgement for one hint bound to an active attempt."""
-    hint = _string(hint_id, "hint_id", identifier=True)
+def ack_hints(conn: sqlite3.Connection, *, hint_ids: Any, task_id: Any, run_id: Any,
+              claim_lock: Any, profile: Any, state: Any, reason_code: Any) -> bool:
+    """Atomically acknowledge one exact bounded hint batch."""
+    if not isinstance(hint_ids, (list, tuple)) or not 1 <= len(hint_ids) <= MAX_HINTS_PER_POLL:
+        raise ProgramControlError("invalid_hint_ids")
+    hints = []
+    for hint_id in hint_ids:
+        if isinstance(hint_id, bool):
+            raise ProgramControlError("invalid_hint_ids")
+        try:
+            hints.append(_string(hint_id, "hint_id", identifier=True))
+        except ProgramControlError:
+            raise ProgramControlError("invalid_hint_ids") from None
+    if len(set(hints)) != len(hints):
+        raise ProgramControlError("invalid_hint_ids")
     task, run, lock, actor_profile = _hint_authority(task_id, run_id, claim_lock, profile)
     if not isinstance(state, str) or state not in _ACK_STATES:
         raise ProgramControlError("invalid_hint_state")
@@ -473,32 +484,56 @@ def ack_hint(conn: sqlite3.Connection, *, hint_id: Any, task_id: Any, run_id: An
         raise ProgramControlError("invalid_reason_code")
     from hermes_cli.kanban_db import _append_hint_event_locked
     with _hint_txn(conn):
-        row = conn.execute(
-            "SELECT root_id,state,terminal_reason_code,run_id,claim_lock,profile "
-            "FROM program_hints WHERE node_id=? AND hint_id=?", (task, hint),
-        ).fetchone()
-        if row is None:
+        placeholders = ",".join("?" for _ in hints)
+        rows = conn.execute(
+            "SELECT root_id,hint_id,state,terminal_reason_code,run_id,claim_lock,profile "
+            f"FROM program_hints WHERE node_id=? AND hint_id IN ({placeholders})",
+            (task, *hints),
+        ).fetchall()
+        if len(rows) != len(hints):
             raise ProgramControlError("unknown_hint")
-        if row["state"] in _ACK_STATES:
-            if row["state"] == state and row["terminal_reason_code"] == reason_code and \
-                    row["run_id"] == run and row["claim_lock"] == lock and row["profile"] == actor_profile:
-                return True
+        replay = [
+            row["state"] == state and row["terminal_reason_code"] == reason_code
+            and row["run_id"] == run and row["claim_lock"] == lock
+            and row["profile"] == actor_profile
+            for row in rows
+        ]
+        seen = [
+            row["state"] == "seen" and row["run_id"] == run
+            and row["claim_lock"] == lock and row["profile"] == actor_profile
+            for row in rows
+        ]
+        if all(replay):
+            return True
+        if not all(seen):
             raise ProgramControlError("hint_ack_conflict")
-        if row["state"] != "seen" or not _exact_active_hint_run(
-                conn, task, run, lock, actor_profile):
+        if not _exact_active_hint_run(conn, task, run, lock, actor_profile):
             raise ProgramControlError("stale_hint_authority")
-        cur = conn.execute(
-            "UPDATE program_hints SET state=?,terminal_at=?,terminal_reason_code=? "
-            "WHERE root_id=? AND node_id=? AND hint_id=? AND state='seen' AND run_id=? "
-            "AND claim_lock=? AND profile=?",
-            (state, int(time.time()), reason_code, row["root_id"], task, hint,
-             run, lock, actor_profile),
-        )
-        if cur.rowcount != 1:
-            raise ProgramControlError("hint_state_conflict")
-        _append_hint_event_locked(conn, task, hint, state, run_id=run,
-                                  reason_code=reason_code)
+        rows_by_hint = {row["hint_id"]: row for row in rows}
+        terminal_at = int(time.time())
+        for hint in hints:
+            row = rows_by_hint[hint]
+            cur = conn.execute(
+                "UPDATE program_hints SET state=?,terminal_at=?,terminal_reason_code=? "
+                "WHERE root_id=? AND node_id=? AND hint_id=? AND state='seen' AND run_id=? "
+                "AND claim_lock=? AND profile=?",
+                (state, terminal_at, reason_code, row["root_id"], task, hint,
+                 run, lock, actor_profile),
+            )
+            if cur.rowcount != 1:
+                raise ProgramControlError("hint_state_conflict")
+            _append_hint_event_locked(conn, task, hint, state, run_id=run,
+                                      reason_code=reason_code)
         return True
+
+
+def ack_hint(conn: sqlite3.Connection, *, hint_id: Any, task_id: Any, run_id: Any,
+             claim_lock: Any, profile: Any, state: Any, reason_code: Any) -> bool:
+    """Compatibility wrapper for a one-item atomic acknowledgement."""
+    return ack_hints(
+        conn, hint_ids=[hint_id], task_id=task_id, run_id=run_id,
+        claim_lock=claim_lock, profile=profile, state=state, reason_code=reason_code,
+    )
 
 
 def reconcile_stale_hints(conn: sqlite3.Connection) -> int:
