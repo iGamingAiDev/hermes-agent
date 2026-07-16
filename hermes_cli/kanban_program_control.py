@@ -319,6 +319,13 @@ def select_decision(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[s
                                "WHERE root_id=? AND checkpoint_id=? AND state='pending' AND version=?",
                                (request["option_id"], now, request["root_id"], request["checkpoint_id"], request["expected_version"]))
         if changed.rowcount != 1: raise ProgramControlError("version_conflict")
+        affected = [item["node_id"] for item in conn.execute(
+            "SELECT node_id FROM program_decision_affected_nodes "
+            "WHERE root_id=? AND checkpoint_id=?",
+            (request["root_id"], request["checkpoint_id"]),
+        ).fetchall()]
+        from hermes_cli.kanban_db import _recompute_ready_locked
+        _recompute_ready_locked(conn, task_ids=affected)
         result_version = request["expected_version"] + 1
         payload = {"checkpoint_id": request["checkpoint_id"], "version": result_version,
                    "selected_option_id": request["option_id"], "state": "selected"}

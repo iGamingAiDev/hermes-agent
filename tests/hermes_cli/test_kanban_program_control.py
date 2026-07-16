@@ -69,6 +69,348 @@ def _hint(root, child, **updates):
     return request
 
 
+def _select(root, **updates):
+    request = {"root_id": root, "checkpoint_id": "checkpoint-1",
+               "option_id": "blue", "expected_version": 1,
+               "idempotency_key": "select-1", "actor": "control:owner"}
+    request.update(updates)
+    return request
+
+
+def test_phase2_pending_decision_gates_recompute_dispatch_and_direct_claim(board):
+    root, child, _ = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+        pc.open_decision(conn, _open(root, child))
+        assert kb.recompute_ready(conn) == 0
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()[0] == "todo"
+
+        # Even stale/manual writers cannot bypass the authoritative claim gate.
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        before = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (child,)).fetchone()[0]
+        assert kb.claim_task(conn, child, claimer="manual") is None
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()[0] == "ready"
+        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (child,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (child,)).fetchone()[0] == before
+
+        spawned = []
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, *_: spawned.append(task.id))
+        assert result.spawned == []
+        assert spawned == []
+
+
+def test_phase2_pending_decision_denies_direct_review_claim_without_mutation(board):
+    root, child, _ = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (child,))
+        pc.open_decision(conn, _open(root, child))
+        before_task = tuple(conn.execute(
+            "SELECT status,current_run_id,claim_lock,claim_expires,started_at "
+            "FROM tasks WHERE id=?", (child,),
+        ).fetchone())
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (child,),
+        ).fetchone()[0]
+        before_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (child,),
+        ).fetchone()[0]
+
+        assert kb.claim_review_task(
+            conn, child, claimer="SECRET-REVIEW-CLAIMER"
+        ) is None
+
+        assert tuple(conn.execute(
+            "SELECT status,current_run_id,claim_lock,claim_expires,started_at "
+            "FROM tasks WHERE id=?", (child,),
+        ).fetchone()) == before_task
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (child,),
+        ).fetchone()[0] == before_events
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (child,),
+        ).fetchone()[0] == before_runs
+        assert "SECRET-REVIEW-CLAIMER" not in json.dumps(
+            [dict(row) for row in conn.execute(
+                "SELECT kind,payload FROM task_events WHERE task_id=?", (child,)
+            )]
+        )
+
+
+def test_phase2_pending_decision_excludes_review_dispatch_candidate(board):
+    root, child, _ = board
+    spawned = []
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (child,))
+        pc.open_decision(conn, _open(root, child))
+        result = kb.dispatch_once(
+            conn, dry_run=True,
+            spawn_fn=lambda task, *_args, **_kwargs: spawned.append(task.id),
+        )
+        assert result.spawned == []
+        assert child not in result.skipped_unassigned
+        assert child not in result.skipped_nonspawnable
+        assert spawned == []
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (child,)
+        ).fetchone()[0] == "review"
+
+
+@pytest.mark.parametrize(
+    ("status", "health_probe"),
+    [
+        ("ready", kb.has_spawnable_ready),
+        ("review", kb.has_spawnable_review),
+    ],
+)
+def test_phase2_pending_decision_excludes_health_probe_until_selected(
+    board, monkeypatch, status, health_probe,
+):
+    """Telemetry must see the same decision-gated candidates as dispatch."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    root, child, other = board
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='archived' WHERE id IN (?, ?)",
+            (root, other),
+        )
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, child))
+        pc.open_decision(conn, _open(root, child))
+
+        assert health_probe(conn) is False
+        assert kb.dispatch_once(conn, dry_run=True).spawned == []
+
+        pc.select_decision(conn, _select(root))
+
+        assert health_probe(conn) is True
+        assert [row[0] for row in kb.dispatch_once(conn, dry_run=True).spawned] == [child]
+
+
+@pytest.mark.parametrize(
+    ("status", "health_probe"),
+    [
+        ("ready", kb.has_spawnable_ready),
+        ("review", kb.has_spawnable_review),
+    ],
+)
+def test_phase2_health_probe_matches_dispatch_with_unaffected_legacy_task(
+    board, monkeypatch, status, health_probe,
+):
+    """A gated task must not hide an unrelated legacy dispatch candidate."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    root, child, other = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (root,))
+        conn.execute("UPDATE tasks SET status=? WHERE id IN (?, ?)", (status, child, other))
+        pc.open_decision(conn, _open(root, child))
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert health_probe(conn) is True
+        assert [row[0] for row in result.spawned] == [other]
+
+
+def test_phase2_select_releases_only_dependency_eligible_statuses(board):
+    root, child, _ = board
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="Parent", assignee="worker")
+        waiting = kb.create_task(conn, title="Waiting", assignee="worker")
+        statuses = {}
+        for status in ("done", "archived", "blocked", "review", "running"):
+            task_id = kb.create_task(conn, title=status, assignee="worker")
+            conn.execute("UPDATE tasks SET status=?, orchestration_root_id=?, orchestration_depth=1, "
+                         "orchestration_parent_id=? WHERE id=?", (status, root, root, task_id))
+            statuses[status] = task_id
+        for task_id in (parent, waiting):
+            conn.execute("UPDATE tasks SET orchestration_root_id=?, orchestration_depth=1, "
+                         "orchestration_parent_id=? WHERE id=?", (root, root, task_id))
+        kb.link_tasks(conn, parent, waiting)
+        conn.execute("INSERT INTO task_events(task_id,kind,created_at) VALUES (?, 'blocked', 1)",
+                     (statuses["blocked"],))
+        affected = [child, waiting, *statuses.values()]
+        pc.open_decision(conn, _open(root, child, affected_node_ids=affected))
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+
+        pc.select_decision(conn, _select(root))
+        rows = {row["id"]: row["status"] for row in conn.execute(
+            f"SELECT id,status FROM tasks WHERE id IN ({','.join('?' for _ in affected)})", affected)}
+        assert rows[child] == "ready"
+        assert rows[waiting] == "todo"
+        assert {status: rows[task_id] for status, task_id in statuses.items()} == {
+            "done": "done", "archived": "archived", "blocked": "blocked",
+            "review": "review", "running": "running",
+        }
+
+
+def test_phase2_select_replay_does_not_recompute_or_duplicate_events(board):
+    root, child, _ = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+        pc.open_decision(conn, _open(root, child))
+        first = pc.select_decision(conn, _select(root))
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+        events = conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='decision_checkpoint_selected'").fetchone()[0]
+        replay = pc.select_decision(conn, _select(root, expected_version=999))
+        assert first["deduplicated"] is False and replay["deduplicated"] is True
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()[0] == "todo"
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='decision_checkpoint_selected'").fetchone()[0] == events
+
+
+def test_phase2_open_and_claim_serialize_across_connections(board):
+    root, child, _ = board
+    path = kb.kanban_db_path()
+    with kb.connect_closing() as setup:
+        setup.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+    barrier = threading.Barrier(2)
+    outcomes = {}
+
+    def opener():
+        with kb.connect_closing(path) as conn:
+            barrier.wait()
+            outcomes["open"] = pc.open_decision(conn, _open(root, child))
+
+    def claimer():
+        with kb.connect_closing(path) as conn:
+            barrier.wait()
+            outcomes["claim"] = kb.claim_task(conn, child, claimer="race")
+
+    threads = [threading.Thread(target=opener), threading.Thread(target=claimer)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    with kb.connect_closing(path) as conn:
+        status = conn.execute("SELECT status FROM tasks WHERE id=?", (child,)).fetchone()[0]
+        assert outcomes["open"]["state"] == "pending"
+        assert (outcomes["claim"] is not None and status == "running") or (
+            outcomes["claim"] is None and status == "ready")
+
+
+def test_phase2_open_and_review_claim_serialize_across_connections(board):
+    root, child, _ = board
+    path = kb.kanban_db_path()
+    with kb.connect_closing(path) as setup:
+        setup.execute("UPDATE tasks SET status='review' WHERE id=?", (child,))
+    barrier = threading.Barrier(2)
+    outcomes = {}
+
+    def opener():
+        with kb.connect_closing(path) as conn:
+            barrier.wait()
+            outcomes["open"] = pc.open_decision(conn, _open(root, child))
+
+    def claimer():
+        with kb.connect_closing(path) as conn:
+            barrier.wait()
+            outcomes["claim"] = kb.claim_review_task(
+                conn, child, claimer="review-race"
+            )
+
+    threads = [threading.Thread(target=opener), threading.Thread(target=claimer)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    with kb.connect_closing(path) as conn:
+        status = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (child,)
+        ).fetchone()[0]
+        assert outcomes["open"]["state"] == "pending"
+        assert (outcomes["claim"] is not None and status == "running") or (
+            outcomes["claim"] is None and status == "review"
+        )
+
+
+def test_phase2_select_and_claim_serialize_across_connections(board):
+    root, child, _ = board
+    path = kb.kanban_db_path()
+    with kb.connect_closing(path) as setup:
+        setup.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        pc.open_decision(setup, _open(root, child))
+    barrier = threading.Barrier(2)
+    outcomes = {}
+
+    def selector():
+        with kb.connect_closing(path) as conn:
+            barrier.wait(); outcomes["select"] = pc.select_decision(conn, _select(root))
+
+    def claimer():
+        with kb.connect_closing(path) as conn:
+            barrier.wait(); outcomes["claim"] = kb.claim_task(conn, child, claimer="race")
+
+    threads = [threading.Thread(target=selector), threading.Thread(target=claimer)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes["select"]["state"] == "selected"
+    # A claim that linearizes before selection is rejected; one after is valid.
+    assert outcomes["claim"] is None or outcomes["claim"].status == "running"
+
+
+def test_phase2_open_does_not_interrupt_running_affected_task(board):
+    root, child, _ = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        claimed = kb.claim_task(conn, child, claimer="existing-run")
+        assert claimed is not None
+        before = conn.execute(
+            "SELECT current_run_id,claim_lock,claim_expires FROM tasks WHERE id=?", (child,)
+        ).fetchone()
+        pc.open_decision(conn, _open(root, child))
+        after = conn.execute(
+            "SELECT status,current_run_id,claim_lock,claim_expires FROM tasks WHERE id=?", (child,)
+        ).fetchone()
+        assert after["status"] == "running"
+        assert tuple(after[key] for key in ("current_run_id", "claim_lock", "claim_expires")) == tuple(before)
+        run = conn.execute("SELECT status,ended_at FROM task_runs WHERE id=?", (before["current_run_id"],)).fetchone()
+        assert tuple(run) == ("running", None)
+
+
+def test_phase2_open_preserves_already_claimed_running_review(board):
+    root, child, _ = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (child,))
+        claimed = kb.claim_review_task(conn, child, claimer="existing-review")
+        assert claimed is not None
+        before = tuple(conn.execute(
+            "SELECT current_run_id,claim_lock,claim_expires FROM tasks WHERE id=?",
+            (child,),
+        ).fetchone())
+
+        pc.open_decision(conn, _open(root, child))
+
+        after = conn.execute(
+            "SELECT status,current_run_id,claim_lock,claim_expires FROM tasks WHERE id=?",
+            (child,),
+        ).fetchone()
+        assert after["status"] == "running"
+        assert tuple(after[key] for key in (
+            "current_run_id", "claim_lock", "claim_expires"
+        )) == before
+        assert tuple(conn.execute(
+            "SELECT status,ended_at FROM task_runs WHERE id=?", (before[0],)
+        ).fetchone()) == ("running", None)
+
+
+def test_phase2_select_releases_review_task_to_review_claim_path(board):
+    root, child, _ = board
+    with kb.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (child,))
+        pc.open_decision(conn, _open(root, child))
+
+        pc.select_decision(conn, _select(root))
+
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (child,)
+        ).fetchone()[0] == "review"
+        claimed = kb.claim_review_task(conn, child, claimer="released-review")
+        assert claimed is not None
+        assert claimed.status == "running"
+
+
 def test_schema_fresh_repeat_and_foreign_keys(board):
     root, child, _ = board
     kb.init_db(); kb.init_db()

@@ -4100,6 +4100,94 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+_PENDING_PROGRAM_DECISION_EXCLUSION_SQL = (
+    "AND NOT EXISTS ("
+    " SELECT 1 FROM program_decision_affected_nodes a "
+    " JOIN program_decisions d ON d.root_id=a.root_id "
+    "  AND d.checkpoint_id=a.checkpoint_id "
+    " WHERE a.node_id=tasks.id AND d.state='pending'"
+    ") "
+)
+
+
+def _has_pending_program_decision_locked(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Return whether a pending decision gates ``task_id``.
+
+    Callers hold the transaction that protects their subsequent state change.
+    ``idx_program_affected_node`` makes the affected-node lookup selective;
+    the decision primary key resolves the joined checkpoint.
+    """
+    return conn.execute(
+        "SELECT 1 FROM program_decision_affected_nodes a "
+        "JOIN program_decisions d ON d.root_id=a.root_id "
+        "AND d.checkpoint_id=a.checkpoint_id "
+        "WHERE a.node_id=? AND d.state='pending' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
+def _recompute_ready_locked(
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
+    task_ids: Optional[Iterable[str]] = None,
+) -> int:
+    """Locked implementation of dependency-ready promotion.
+
+    This helper never opens or commits a transaction, allowing decision
+    selection and ready release to remain one atomic mutation.
+    """
+    if failure_limit is None:
+        failure_limit = DEFAULT_FAILURE_LIMIT
+    params: list[Any] = []
+    where = "status IN ('todo', 'blocked')"
+    if task_ids is not None:
+        ids = list(dict.fromkeys(task_ids))
+        if not ids:
+            return 0
+        where += f" AND id IN ({','.join('?' for _ in ids)})"
+        params.extend(ids)
+    promoted = 0
+    todo_rows = conn.execute(
+        "SELECT id, status, consecutive_failures, max_retries "
+        f"FROM tasks WHERE {where}", params,
+    ).fetchall()
+    for row in todo_rows:
+        task_id = row["id"]
+        cur_status = row["status"]
+        if _has_pending_program_decision_locked(conn, task_id):
+            continue
+        if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            continue
+        parents = conn.execute(
+            "SELECT t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ?", (task_id,),
+        ).fetchall()
+        if not all(p["status"] in ("done", "archived") for p in parents):
+            continue
+        if cur_status == "blocked":
+            failures = int(row["consecutive_failures"] or 0)
+            task_limit = row["max_retries"]
+            effective_limit = int(task_limit) if task_limit is not None else int(failure_limit)
+            if failures >= effective_limit:
+                continue
+            changed = conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'blocked'",
+                (task_id,),
+            )
+        else:
+            changed = conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                (task_id,),
+            )
+        if changed.rowcount == 1:
+            _append_event(conn, task_id, "promoted", None)
+            promoted += 1
+    return promoted
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4131,60 +4219,8 @@ def recompute_ready(
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
     """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
-    promoted = 0
     with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
-        ).fetchall()
-        for row in todo_rows:
-            task_id = row["id"]
-            cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
-                if cur_status == "blocked":
-                    # Don't auto-recover tasks that have hit the
-                    # circuit-breaker failure limit.  Without this
-                    # guard, a task that repeatedly exhausts its
-                    # iteration budget would cycle forever:
-                    # block → auto-recover → respawn → budget
-                    # exhausted → block → …  The counter must also
-                    # be preserved so the breaker can accumulate
-                    # across recovery cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
-                    )
-                    if failures >= effective_limit:
-                        continue
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
-                _append_event(conn, task_id, "promoted", None)
-                promoted += 1
-    return promoted
+        return _recompute_ready_locked(conn, failure_limit=failure_limit)
 
 
 # ---------------------------------------------------------------------------
@@ -4273,6 +4309,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _has_pending_program_decision_locked(conn, task_id):
+            return None
         if not _admit_program_run(conn, task_id, now):
             return None
         # Structural invariant: never transition ready -> running while any
@@ -4404,6 +4442,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _has_pending_program_decision_locked(conn, task_id):
+            return None
         if not _admit_program_run(conn, task_id, now):
             return None
         cur = conn.execute(
@@ -8232,7 +8272,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        + _PENDING_PROGRAM_DECISION_EXCLUSION_SQL
     ).fetchall()
     if not rows:
         return False
@@ -8258,7 +8299,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        + _PENDING_PROGRAM_DECISION_EXCLUSION_SQL
     ).fetchall()
     if not rows:
         return False
@@ -8427,6 +8469,8 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        + _PENDING_PROGRAM_DECISION_EXCLUSION_SQL
+        +
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
@@ -8669,6 +8713,8 @@ def _dispatch_once_locked(
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
+        + _PENDING_PROGRAM_DECISION_EXCLUSION_SQL
+        +
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
