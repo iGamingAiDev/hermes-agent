@@ -194,8 +194,9 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
 _INVALID_REQUEST_JSON = '{"error":"invalid_request","ok":false}'
 
 _PROGRAM_CAPABILITIES = (
-    ("version", 1),
-    ("schema", 1),
+    ("version", 2),
+    ("schema", 2),
+    ("operator_visible_decision_briefs", 1),
     ("cli", 1),
     ("dispatcher_gate", 1),
     ("classic_worker_boundary", 1),
@@ -1560,10 +1561,11 @@ def _cmd_program_capabilities(args: argparse.Namespace) -> int:
         if (
             not isinstance(constants, tuple)
             or tuple(name for name, _value in constants) != (
-                "version", "schema", "cli", "dispatcher_gate",
+                "version", "schema", "operator_visible_decision_briefs", "cli", "dispatcher_gate",
                 "classic_worker_boundary", "goal_loop_boundary", "ack_writer", "events",
             )
-            or any(type(value) is not int or value != 1 for _name, value in constants)
+            or any(type(value) is not int for _name, value in constants)
+            or tuple(value for _name, value in constants) != (2, 2, 1, 1, 1, 1, 1, 1, 1)
         ):
             raise RuntimeError("incomplete capability contract")
         result = {"contract": "hermes-program-control", "board": board}

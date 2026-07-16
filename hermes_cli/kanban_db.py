@@ -1321,6 +1321,35 @@ CREATE TABLE IF NOT EXISTS program_decision_options (
     PRIMARY KEY (root_id, checkpoint_id, option_id),
     FOREIGN KEY (root_id, checkpoint_id) REFERENCES program_decisions(root_id, checkpoint_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS program_decision_public_briefs (
+    root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    classification TEXT NOT NULL CHECK (classification = 'operator_visible'),
+    title TEXT NOT NULL, recommendation_rationale TEXT NOT NULL,
+    recommended_option_id TEXT NOT NULL, content_digest TEXT NOT NULL
+        CHECK (length(content_digest) = 64 AND content_digest NOT GLOB '*[^0-9a-f]*'),
+    generated_at INTEGER NOT NULL CHECK (generated_at >= 0 AND generated_at <= 9007199254740991),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0 AND created_at <= 9007199254740991),
+    CHECK (generated_at = created_at),
+    PRIMARY KEY (root_id, checkpoint_id),
+    FOREIGN KEY (root_id, checkpoint_id) REFERENCES program_decisions(root_id, checkpoint_id) ON DELETE CASCADE,
+    FOREIGN KEY (root_id, checkpoint_id, recommended_option_id)
+        REFERENCES program_decision_options(root_id, checkpoint_id, option_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE IF NOT EXISTS program_decision_public_options (
+    root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, option_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal <= 3),
+    label TEXT NOT NULL, summary TEXT NOT NULL, benefits TEXT NOT NULL, risks TEXT NOT NULL,
+    reversibility TEXT NOT NULL CHECK (reversibility IN ('reversible','partially_reversible','irreversible')),
+    security_impact TEXT NOT NULL, cost_impact TEXT NOT NULL, operations_impact TEXT NOT NULL,
+    PRIMARY KEY (root_id, checkpoint_id, option_id),
+    UNIQUE (root_id, checkpoint_id, ordinal),
+    FOREIGN KEY (root_id, checkpoint_id) REFERENCES program_decision_public_briefs(root_id, checkpoint_id) ON DELETE CASCADE,
+    FOREIGN KEY (root_id, checkpoint_id, option_id, ordinal)
+        REFERENCES program_decision_options(root_id, checkpoint_id, option_id, ordinal)
+        DEFERRABLE INITIALLY DEFERRED
+);
 CREATE TABLE IF NOT EXISTS program_decision_affected_nodes (
     root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
     node_id TEXT NOT NULL,
@@ -1386,6 +1415,8 @@ CREATE TABLE IF NOT EXISTS program_control_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_program_decisions_node ON program_decisions(root_id, node_id, state);
 CREATE INDEX IF NOT EXISTS idx_program_affected_node ON program_decision_affected_nodes(node_id, root_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_program_decision_options_ordinal
+    ON program_decision_options(root_id, checkpoint_id, option_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_program_hints_node_state ON program_hints(root_id, node_id, state, created_at);
 """
 
@@ -1403,6 +1434,49 @@ def _create_program_control_schema(conn: sqlite3.Connection) -> None:
             statement = ""
     if statement.strip():  # pragma: no cover - constant is complete by design
         raise RuntimeError("incomplete program-control schema statement")
+
+
+def _program_control_schema_statements() -> Iterable[str]:
+    statement = ""
+    for line in _PROGRAM_CONTROL_SCHEMA_SQL.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            yield statement
+            statement = ""
+    if statement.strip():  # pragma: no cover - constant is complete by design
+        raise RuntimeError("incomplete program-control schema statement")
+
+
+def _is_exact_a3_migration_candidate(conn: sqlite3.Connection) -> bool:
+    existing = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    public = {"program_decision_public_briefs", "program_decision_public_options"}
+    return not existing.intersection(public) and set(_PROGRAM_CONTROL_COLUMNS) - public <= existing
+
+
+def _migrate_exact_a3_to_a4(conn: sqlite3.Connection) -> None:
+    """Atomically revalidate A3 and install only the additive A4 objects."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _validate_existing_program_control_schema(conn)
+        _migrate_phase2_program_hints_locked(conn)
+        _validate_existing_program_control_schema(conn)
+        targets = (
+            "CREATE TABLE IF NOT EXISTS program_decision_public_briefs",
+            "CREATE TABLE IF NOT EXISTS program_decision_public_options",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_program_decision_options_ordinal",
+        )
+        for statement in _program_control_schema_statements():
+            if statement.lstrip().startswith(targets):
+                conn.execute(statement)
+        _validate_program_control_schema(conn)
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("program-control foreign keys are invalid")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 SCHEMA_SQL = """
@@ -2242,6 +2316,18 @@ def validate_current_program_control_schema_read_only(path: Path) -> None:
                 raise RuntimeError("tasks program-control version is missing")
             _validate_existing_program_control_version(connection)
             _validate_program_control_schema(connection)
+            # Capability v2 is earned by durable state, not schema alone.
+            # Historical selected/superseded A3 rows intentionally remain
+            # private; every currently pending A4 checkpoint must have its
+            # complete, independently validated public artifact.
+            from hermes_cli import kanban_program_control as program_control
+            for row in connection.execute(
+                "SELECT root_id,checkpoint_id FROM program_decisions WHERE state='pending'"
+            ):
+                if not program_control._valid_stored_public_brief(
+                    connection, row["root_id"], row["checkpoint_id"]
+                ):
+                    raise RuntimeError("public_brief_unavailable")
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise RuntimeError("program-control foreign keys are invalid")
         finally:
@@ -2380,7 +2466,11 @@ def connect(
                     # process are cheap. The lock prevents same-process dispatcher
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
-                    conn.executescript(SCHEMA_SQL)
+                    exact_a3 = _is_exact_a3_migration_candidate(conn)
+                    if exact_a3:
+                        _migrate_exact_a3_to_a4(conn)
+                    else:
+                        conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn, existing_program_schema_validated=True)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
@@ -2765,6 +2855,13 @@ _PROGRAM_CONTROL_COLUMNS = {
     "program_decision_options": {"root_id", "checkpoint_id", "option_id", "ordinal", "label",
                                  "summary", "benefits", "risks", "reversibility", "security_impact",
                                  "cost_impact", "operations_impact"},
+    "program_decision_public_briefs": {"root_id", "checkpoint_id", "schema_version",
+                                        "classification", "title", "recommendation_rationale",
+                                        "recommended_option_id", "content_digest", "generated_at",
+                                        "created_at"},
+    "program_decision_public_options": {"root_id", "checkpoint_id", "option_id", "ordinal",
+                                         "label", "summary", "benefits", "risks", "reversibility",
+                                         "security_impact", "cost_impact", "operations_impact"},
     "program_decision_affected_nodes": {"root_id", "checkpoint_id", "node_id"},
     "program_hints": {"root_id", "hint_id", "node_id", "text", "actor", "idempotency_key",
                       "expected_node_version", "committed_node_version", "state", "run_id",
@@ -3140,7 +3237,10 @@ def _program_control_statement(prefix: str) -> str:
     raise RuntimeError(f"missing canonical schema statement: {prefix}")
 
 
-def _migrate_phase2_program_hints(conn: sqlite3.Connection) -> None:
+def _migrate_phase2_program_hints_locked(conn: sqlite3.Connection) -> None:
+    """Migrate the exact Phase2 hint table while the caller holds a write txn."""
+    if not conn.in_transaction:
+        raise RuntimeError("program_hints Phase2 migration requires a write transaction")
     if not _program_hints_is_phase2(conn):
         return
     _validate_phase2_program_hint_rows(conn)
@@ -3149,33 +3249,40 @@ def _migrate_phase2_program_hints(conn: sqlite3.Connection) -> None:
     _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
     columns = tuple(row["name"] for row in conn.execute("PRAGMA table_xinfo(program_hints)"))
     quoted_columns = ", ".join(f'"{column}"' for column in columns)
+    conn.execute("ALTER TABLE program_hints RENAME TO program_hints_phase2")
+    conn.execute("DROP INDEX idx_program_hints_node_state")
+    conn.execute(_program_control_statement("CREATE TABLE IF NOT EXISTS program_hints"))
+    conn.execute(
+        f"INSERT INTO program_hints ({quoted_columns}) "
+        f"SELECT {quoted_columns} FROM program_hints_phase2"
+    )
+    conn.execute("DROP TABLE program_hints_phase2")
+    conn.execute(_program_control_statement(
+        "CREATE INDEX IF NOT EXISTS idx_program_hints_node_state"
+    ))
+    if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise RuntimeError("program_hints Phase2 migration violated foreign keys")
+    _validate_program_hints_phase2_removed(conn)
+
+
+def _migrate_phase2_program_hints(conn: sqlite3.Connection) -> None:
+    if not _program_hints_is_phase2(conn):
+        return
+    _validate_phase2_program_hint_rows(conn)
+    _validate_phase2_program_hints_has_no_inbound_foreign_keys(conn)
+    _validate_phase2_program_hints_temporary_name_available(conn)
+    _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
     with write_txn(conn):
         # Recheck under the write lock, closing the preflight-to-migration gap.
         if not _program_hints_is_phase2(conn):
             raise RuntimeError("program_hints schema changed during Phase2 migration")
-        _validate_phase2_program_hint_rows(conn)
-        _validate_phase2_program_hints_has_no_inbound_foreign_keys(conn)
-        _validate_phase2_program_hints_temporary_name_available(conn)
-        _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
-        conn.execute("ALTER TABLE program_hints RENAME TO program_hints_phase2")
-        conn.execute("DROP INDEX idx_program_hints_node_state")
-        conn.execute(_program_control_statement("CREATE TABLE IF NOT EXISTS program_hints"))
-        conn.execute(
-            f"INSERT INTO program_hints ({quoted_columns}) "
-            f"SELECT {quoted_columns} FROM program_hints_phase2"
-        )
-        conn.execute("DROP TABLE program_hints_phase2")
-        conn.execute(_program_control_statement(
-            "CREATE INDEX IF NOT EXISTS idx_program_hints_node_state"
-        ))
-        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise RuntimeError("program_hints Phase2 migration violated foreign keys")
-        _validate_program_hints_phase2_removed(conn)
+        _migrate_phase2_program_hints_locked(conn)
 
 
 def _program_control_named_indexes(conn: sqlite3.Connection) -> tuple:
     names = ("idx_tasks_program_lineage", "idx_program_decisions_node",
-             "idx_program_affected_node", "idx_program_hints_node_state")
+             "idx_program_affected_node", "idx_program_decision_options_ordinal",
+             "idx_program_hints_node_state")
     if _has_canonical_task_runs_parent(conn):
         names += ("idx_task_runs_id_task_id",)
     result = []
@@ -3237,15 +3344,56 @@ def _validate_existing_program_control_schema(conn: sqlite3.Connection) -> None:
     existing = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
     )}
+    public_tables = {"program_decision_public_briefs", "program_decision_public_options"}
+    present_public_tables = existing.intersection(public_tables)
+    if present_public_tables and present_public_tables != public_tables:
+        raise RuntimeError("program-control public schema is incomplete or incompatible")
+    exact_a3 = (
+        not existing.intersection(public_tables)
+        and set(_PROGRAM_CONTROL_COLUMNS) - public_tables <= existing
+    )
     for table in _PROGRAM_CONTROL_COLUMNS:
         if table not in existing:
             continue
-        _validate_program_control_table(conn, table, allow_phase2_hints=True)
+        if exact_a3 and table == "program_decision_options":
+            actual = _program_control_shape(conn, table)
+            expected = _canonical_program_control_shapes()[table]
+            expected = (*expected[:3], tuple(
+                item for item in expected[3]
+                if item[0] != "idx_program_decision_options_ordinal"
+            ))
+            if actual != expected:
+                raise RuntimeError(f"{table} schema is incomplete or incompatible")
+        else:
+            _validate_program_control_table(conn, table, allow_phase2_hints=True)
         if table == "program_hints" and _program_hints_is_phase2(conn):
             _validate_phase2_program_hint_rows(conn)
             _validate_phase2_program_hints_has_no_inbound_foreign_keys(conn)
             _validate_phase2_program_hints_temporary_name_available(conn)
             _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
+    if exact_a3:
+        # Canonical A3 is the sole predecessor. Its tables are validated above;
+        # require its exact named indexes and no A4 ordinal index. Creation then
+        # adds only the two public tables and their required parent index.
+        actual = tuple(item for item in _program_control_named_indexes(conn)
+                       if item[0] != "idx_program_decision_options_ordinal")
+        expected = tuple(item for item in _canonical_program_control_named_indexes(
+            include_run_parent=_has_canonical_task_runs_parent(conn)
+        ) if item[0] != "idx_program_decision_options_ordinal")
+        ordinal = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_program_decision_options_ordinal'"
+        ).fetchone()
+        if actual != expected or ordinal is not None:
+            raise RuntimeError("program-control A3 predecessor schema is incomplete or incompatible")
+        # A3 never carried an explicit operator-visible brief. Raw decision
+        # prose is not a safe migration source, so a pending checkpoint makes
+        # this exact predecessor non-upgradable. This check runs in read-only
+        # preflight and again before any write-producing initialization.
+        if conn.execute(
+            "SELECT 1 FROM program_decisions WHERE state='pending' LIMIT 1"
+        ).fetchone() is not None:
+            raise RuntimeError("legacy_pending_public_brief_required")
+        return
     if existing.intersection(_PROGRAM_CONTROL_COLUMNS) and (
         _program_control_named_indexes(conn) != _canonical_program_control_named_indexes(
             include_run_parent=_has_canonical_task_runs_parent(conn)
