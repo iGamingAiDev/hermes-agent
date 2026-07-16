@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
 import json
 import re
@@ -368,3 +369,173 @@ def add_hint(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any
         return {"ok": True, "hint_id": hint_id, "node_id": request["node_id"], "state": "recorded",
                 "node_version": committed, "deduplicated": False}
     return _mutation(conn, request, "hint_add", "expected_node_version", operation)
+
+
+_ACK_STATES = {"incorporated", "deferred", "rejected"}
+_ACK_REASONS = {
+    "incorporated": {"incorporated"},
+    "deferred": {"not_applicable", "superseded"},
+    "rejected": {"unsafe", "invalid"},
+}
+MAX_HINTS_PER_POLL = 4
+MAX_HINT_CODEPOINTS_PER_POLL = 8000
+
+
+@contextlib.contextmanager
+def _hint_txn(conn: sqlite3.Connection):
+    """Join a caller transaction without committing it, otherwise lock writes."""
+    if conn.in_transaction:
+        conn.execute("SAVEPOINT hint_lifecycle")
+        try:
+            yield
+        except Exception:
+            conn.execute("ROLLBACK TO hint_lifecycle")
+            conn.execute("RELEASE hint_lifecycle")
+            raise
+        else:
+            conn.execute("RELEASE hint_lifecycle")
+    else:
+        from hermes_cli.kanban_db import write_txn
+        with write_txn(conn):
+            yield
+
+
+def _hint_authority(task_id: Any, run_id: Any, claim_lock: Any, profile: Any) -> tuple[str, int, str, str]:
+    task = _string(task_id, "task_id", identifier=True)
+    run = _integer(run_id, "run_id")
+    if run == 0:
+        raise ProgramControlError("invalid_run_id")
+    lock = _string(claim_lock, "claim_lock", maximum=512)
+    actor_profile = _string(profile, "profile", maximum=128, identifier=True)
+    return task, run, lock, actor_profile
+
+
+def _exact_active_hint_run(conn: sqlite3.Connection, task_id: str, run_id: int,
+                           claim_lock: str, profile: str) -> bool:
+    now = int(time.time())
+    exact = conn.execute(
+        "SELECT 1 FROM tasks t JOIN task_runs r ON r.id=? AND r.task_id=t.id "
+        "WHERE t.id=? AND t.status='running' AND t.current_run_id=? "
+        "AND t.claim_lock=? AND t.assignee=? AND t.claim_expires>=? AND r.status='running' "
+        "AND r.claim_lock=? AND r.profile=? AND r.claim_expires>=? AND r.ended_at IS NULL",
+        (run_id, task_id, run_id, claim_lock, profile, now, claim_lock, profile, now),
+    ).fetchone() is not None
+    if not exact:
+        return False
+    from hermes_cli.kanban_db import _program_deadline
+    return not _program_deadline(conn, task_id, now)[2]
+
+
+def poll_hints(conn: sqlite3.Connection, *, task_id: Any, run_id: Any,
+               claim_lock: Any, profile: Any) -> list[dict[str, str]]:
+    """Atomically bind a bounded recorded batch to an exact active attempt."""
+    task, run, lock, actor_profile = _hint_authority(
+        task_id, run_id, claim_lock, profile
+    )
+    from hermes_cli.kanban_db import _append_hint_event_locked
+    with _hint_txn(conn):
+        if not _exact_active_hint_run(conn, task, run, lock, actor_profile):
+            raise ProgramControlError("stale_hint_authority")
+        candidates = conn.execute(
+            "SELECT root_id,hint_id,text FROM program_hints "
+            "WHERE node_id=? AND state='recorded' ORDER BY created_at,hint_id",
+            (task,),
+        ).fetchall()
+        selected = []
+        total = 0
+        for row in candidates:
+            size = len(row["text"])
+            if len(selected) >= MAX_HINTS_PER_POLL or total + size > MAX_HINT_CODEPOINTS_PER_POLL:
+                break
+            selected.append(row)
+            total += size
+        delivered_at = int(time.time())
+        for row in selected:
+            cur = conn.execute(
+                "UPDATE program_hints SET state='seen',run_id=?,claim_lock=?,profile=?,delivered_at=? "
+                "WHERE root_id=? AND hint_id=? AND state='recorded'",
+                (run, lock, actor_profile, delivered_at, row["root_id"], row["hint_id"]),
+            )
+            if cur.rowcount != 1:
+                raise ProgramControlError("hint_state_conflict")
+            _append_hint_event_locked(conn, task, row["hint_id"], "seen", run_id=run)
+        return [{"hint_id": row["hint_id"], "text": row["text"]} for row in selected]
+
+
+def ack_hint(conn: sqlite3.Connection, *, hint_id: Any, task_id: Any, run_id: Any,
+             claim_lock: Any, profile: Any, state: Any, reason_code: Any) -> bool:
+    """Terminal CAS acknowledgement for one hint bound to an active attempt."""
+    hint = _string(hint_id, "hint_id", identifier=True)
+    task, run, lock, actor_profile = _hint_authority(task_id, run_id, claim_lock, profile)
+    if not isinstance(state, str) or state not in _ACK_STATES:
+        raise ProgramControlError("invalid_hint_state")
+    if not isinstance(reason_code, str) or reason_code not in _ACK_REASONS[state]:
+        raise ProgramControlError("invalid_reason_code")
+    from hermes_cli.kanban_db import _append_hint_event_locked
+    with _hint_txn(conn):
+        row = conn.execute(
+            "SELECT root_id,state,terminal_reason_code,run_id,claim_lock,profile "
+            "FROM program_hints WHERE node_id=? AND hint_id=?", (task, hint),
+        ).fetchone()
+        if row is None:
+            raise ProgramControlError("unknown_hint")
+        if row["state"] in _ACK_STATES:
+            if row["state"] == state and row["terminal_reason_code"] == reason_code and \
+                    row["run_id"] == run and row["claim_lock"] == lock and row["profile"] == actor_profile:
+                return True
+            raise ProgramControlError("hint_ack_conflict")
+        if row["state"] != "seen" or not _exact_active_hint_run(
+                conn, task, run, lock, actor_profile):
+            raise ProgramControlError("stale_hint_authority")
+        cur = conn.execute(
+            "UPDATE program_hints SET state=?,terminal_at=?,terminal_reason_code=? "
+            "WHERE root_id=? AND node_id=? AND hint_id=? AND state='seen' AND run_id=? "
+            "AND claim_lock=? AND profile=?",
+            (state, int(time.time()), reason_code, row["root_id"], task, hint,
+             run, lock, actor_profile),
+        )
+        if cur.rowcount != 1:
+            raise ProgramControlError("hint_state_conflict")
+        _append_hint_event_locked(conn, task, hint, state, run_id=run,
+                                  reason_code=reason_code)
+        return True
+
+
+def reconcile_stale_hints(conn: sqlite3.Connection) -> int:
+    """Terminalize seen hints whose bound capability is no longer active."""
+    from hermes_cli.kanban_db import _append_hint_event_locked
+    with _hint_txn(conn):
+        now = int(time.time())
+        rows = conn.execute(
+            "SELECT h.root_id,h.hint_id,h.node_id,h.run_id FROM program_hints h "
+            "LEFT JOIN tasks t ON t.id=h.node_id LEFT JOIN task_runs r ON r.id=h.run_id "
+            "WHERE h.state='seen' AND NOT COALESCE((t.status='running' AND t.current_run_id=h.run_id "
+            "AND t.claim_lock=h.claim_lock AND t.assignee=h.profile AND r.task_id=h.node_id "
+            "AND r.status='running' AND r.claim_lock=h.claim_lock AND r.profile=h.profile "
+            "AND t.claim_expires>=? AND r.claim_expires>=? "
+            "AND r.ended_at IS NULL),0) ORDER BY h.created_at,h.hint_id",
+            (now, now),
+        ).fetchall()
+        from hermes_cli.kanban_db import _program_deadline
+        active_deadline_rows = conn.execute(
+            "SELECT h.root_id,h.hint_id,h.node_id,h.run_id FROM program_hints h "
+            "WHERE h.state='seen' ORDER BY h.created_at,h.hint_id"
+        ).fetchall()
+        keyed = {(row["root_id"], row["hint_id"]): row for row in rows}
+        for row in active_deadline_rows:
+            if _program_deadline(conn, row["node_id"], now)[2]:
+                keyed[(row["root_id"], row["hint_id"])] = row
+        rows = list(keyed.values())
+        changed = 0
+        for row in rows:
+            cur = conn.execute(
+                "UPDATE program_hints SET state='reconcile',terminal_at=?,"
+                "terminal_reason_code='stale_seen' WHERE root_id=? AND hint_id=? "
+                "AND node_id=? AND state='seen'",
+                (now, row["root_id"], row["hint_id"], row["node_id"]),
+            )
+            if cur.rowcount == 1:
+                _append_hint_event_locked(conn, row["node_id"], row["hint_id"], "reconcile",
+                                          run_id=row["run_id"], reason_code="stale_seen")
+                changed += 1
+        return changed

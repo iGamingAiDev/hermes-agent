@@ -1321,6 +1321,42 @@ CREATE TABLE IF NOT EXISTS program_hints (
     state TEXT NOT NULL CHECK (state IN ('recorded','seen','incorporated','deferred','rejected','reconcile')),
     run_id INTEGER, claim_lock TEXT, profile TEXT, created_at INTEGER NOT NULL,
     delivered_at INTEGER, terminal_at INTEGER, terminal_reason_code TEXT,
+    CHECK (terminal_reason_code IS NULL OR terminal_reason_code IN
+      ('incorporated','not_applicable','superseded','unsafe','invalid',
+       'stale_seen','terminal_before_delivery')),
+    CHECK (
+      (state = 'recorded' AND run_id IS NULL AND claim_lock IS NULL
+       AND profile IS NULL AND delivered_at IS NULL AND terminal_at IS NULL
+       AND terminal_reason_code IS NULL)
+      OR
+      (state = 'seen' AND run_id IS NOT NULL AND claim_lock IS NOT NULL
+       AND profile IS NOT NULL AND delivered_at IS NOT NULL
+       AND terminal_at IS NULL AND terminal_reason_code IS NULL)
+      OR
+      (state = 'incorporated' AND terminal_reason_code = 'incorporated'
+       AND run_id IS NOT NULL
+       AND claim_lock IS NOT NULL AND profile IS NOT NULL
+       AND delivered_at IS NOT NULL AND terminal_at IS NOT NULL
+      )
+      OR
+      (state = 'reconcile' AND terminal_reason_code = 'stale_seen'
+       AND run_id IS NOT NULL AND claim_lock IS NOT NULL AND profile IS NOT NULL
+       AND delivered_at IS NOT NULL AND terminal_at IS NOT NULL)
+      OR
+      (state = 'deferred' AND terminal_at IS NOT NULL AND
+       ((terminal_reason_code = 'terminal_before_delivery'
+         AND run_id IS NULL AND claim_lock IS NULL AND profile IS NULL
+         AND delivered_at IS NULL)
+        OR
+        (terminal_reason_code IN ('not_applicable','superseded')
+         AND run_id IS NOT NULL AND claim_lock IS NOT NULL AND profile IS NOT NULL
+         AND delivered_at IS NOT NULL)))
+      OR
+      (state = 'rejected' AND terminal_reason_code IN ('unsafe','invalid')
+       AND terminal_at IS NOT NULL AND run_id IS NOT NULL
+       AND claim_lock IS NOT NULL AND profile IS NOT NULL
+       AND delivered_at IS NOT NULL)
+    ),
     PRIMARY KEY (root_id, hint_id), UNIQUE (root_id, idempotency_key),
     FOREIGN KEY (root_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
     FOREIGN KEY (node_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
@@ -1542,7 +1578,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
-""" + _PROGRAM_CONTROL_SCHEMA_SQL
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -2432,12 +2468,6 @@ def _migrate_add_optional_columns(
         "ON task_events(run_id, id)"
     )
 
-    # Direct callers of this legacy helper do not run aggregate SCHEMA_SQL.
-    # Install the same canonical A3 DDL used by fresh databases, then require
-    # the complete schema to validate (including tables that were absent).
-    _create_program_control_schema(conn)
-    _validate_program_control_schema(conn)
-
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -2520,7 +2550,21 @@ def _migrate_add_optional_columns(
             (new, old),
         )
 
+    # Rebuild legacy parent tables before creating program_hints. SQLite
+    # rewrites child FK targets during ALTER TABLE ... RENAME, so creating A3
+    # first would strand its run FK on ``task_runs_legacy`` and silently drop
+    # the required unique parent index when that table is removed.
     _rebuild_drifted_tables(conn)
+
+    # Phase2 shipped this table with the final columns/keys but before the
+    # lifecycle-pair CHECK. Upgrade that one exact predecessor in isolation.
+    _migrate_phase2_program_hints(conn)
+
+    # Direct callers of this legacy helper do not run aggregate SCHEMA_SQL.
+    # Install canonical A3 only after all parent migrations, then require the
+    # exact complete schema (including named indexes) with no rebuild path.
+    _create_program_control_schema(conn)
+    _validate_program_control_schema(conn)
 
 
 _PROGRAM_CONTROL_COLUMNS = {
@@ -2634,6 +2678,310 @@ def _canonical_program_control_shapes() -> dict[str, tuple]:
             for table in _PROGRAM_CONTROL_COLUMNS}
 
 
+_PHASE2_PROGRAM_HINTS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS program_hints (
+    root_id TEXT NOT NULL,
+    hint_id TEXT NOT NULL, node_id TEXT NOT NULL,
+    text TEXT NOT NULL, actor TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    expected_node_version INTEGER NOT NULL, committed_node_version INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('recorded','seen','incorporated','deferred','rejected','reconcile')),
+    run_id INTEGER, claim_lock TEXT, profile TEXT, created_at INTEGER NOT NULL,
+    delivered_at INTEGER, terminal_at INTEGER, terminal_reason_code TEXT,
+    PRIMARY KEY (root_id, hint_id), UNIQUE (root_id, idempotency_key),
+    FOREIGN KEY (root_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id, root_id) REFERENCES tasks(id, orchestration_root_id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id, node_id) REFERENCES task_runs(id, task_id)
+)
+"""
+
+
+def _phase2_program_hints_shape() -> tuple:
+    reference = sqlite3.connect(":memory:")
+    reference.row_factory = sqlite3.Row
+    reference.executescript(
+        "CREATE TABLE tasks(id TEXT PRIMARY KEY, orchestration_root_id TEXT);"
+        "CREATE TABLE task_runs(id INTEGER PRIMARY KEY, task_id TEXT NOT NULL);"
+        + _PHASE2_PROGRAM_HINTS_SCHEMA_SQL
+        + ";CREATE INDEX IF NOT EXISTS idx_program_hints_node_state "
+          "ON program_hints(root_id, node_id, state, created_at);"
+    )
+    shape = _program_control_shape(reference, "program_hints")
+    reference.close()
+    return shape
+
+
+def _program_hints_is_phase2(conn: sqlite3.Connection) -> bool:
+    return _program_control_shape(conn, "program_hints") == _phase2_program_hints_shape()
+
+
+def _validate_phase2_program_hint_rows(conn: sqlite3.Connection) -> None:
+    invalid = conn.execute(
+        "SELECT 1 FROM program_hints WHERE state <> 'recorded' "
+        "OR run_id IS NOT NULL OR claim_lock IS NOT NULL OR profile IS NOT NULL "
+        "OR delivered_at IS NOT NULL OR terminal_at IS NOT NULL "
+        "OR terminal_reason_code IS NOT NULL LIMIT 1"
+    ).fetchone()
+    if invalid is not None:
+        raise RuntimeError("program_hints Phase2 rows are incompatible with Phase3A")
+
+
+def _validate_phase2_program_hints_has_no_inbound_foreign_keys(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reject a rename migration that would retarget external child FKs."""
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+    ).fetchall()
+    for row in tables:
+        table = row["name"]
+        quoted_table = '"' + table.replace('"', '""') + '"'
+        if any(
+            foreign_key["table"].casefold() == "program_hints"
+            for foreign_key in conn.execute(f"PRAGMA foreign_key_list({quoted_table})")
+        ):
+            raise RuntimeError(
+                "program_hints Phase2 migration blocked by inbound foreign key"
+            )
+
+
+def _validate_phase2_program_hints_temporary_name_available(
+    conn: sqlite3.Connection,
+) -> None:
+    collision = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name=? LIMIT 1",
+        ("program_hints_phase2",),
+    ).fetchone()
+    if collision is not None:
+        raise RuntimeError(
+            "program_hints Phase2 migration blocked by existing "
+            "program_hints_phase2 schema object"
+        )
+
+
+def _sqlite_sql_identifier_tokens(sql: str) -> tuple[str, ...]:
+    """Extract SQLite identifiers while excluding literals and comments.
+
+    This is intentionally a small lexer, not a SQL parser.  Rename safety only
+    needs exact identifier tokens, but substring matching is unsafe because it
+    confuses string/comment canaries and names such as ``my_program_hints``.
+    SQLite's single-quote compatibility is honored only where the grammar
+    requires a table name.
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        raise ValueError("missing SQLite schema SQL")
+    lexical_tokens = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char.isspace():
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            newline = sql.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end < 0:
+                raise ValueError("unterminated SQLite block comment")
+            index = end + 2
+            continue
+        if char == "'":
+            index += 1
+            value = []
+            while index < length:
+                if sql[index] != "'":
+                    value.append(sql[index])
+                    index += 1
+                elif index + 1 < length and sql[index + 1] == "'":
+                    value.append("'")
+                    index += 2
+                else:
+                    index += 1
+                    lexical_tokens.append(("single", "".join(value).casefold()))
+                    break
+            else:
+                raise ValueError("unterminated SQLite string literal")
+            continue
+        if char in {'"', "`", "["}:
+            closing = "]" if char == "[" else char
+            index += 1
+            value = []
+            while index < length:
+                if sql[index] != closing:
+                    value.append(sql[index])
+                    index += 1
+                elif closing != "]" and index + 1 < length and sql[index + 1] == closing:
+                    value.append(closing)
+                    index += 2
+                else:
+                    index += 1
+                    lexical_tokens.append(("identifier", "".join(value).casefold()))
+                    break
+            else:
+                raise ValueError("unterminated SQLite quoted identifier")
+            continue
+        if char.isalpha() or char == "_" or ord(char) >= 128:
+            start = index
+            index += 1
+            while index < length and (
+                sql[index].isalnum() or sql[index] in {"_", "$"} or ord(sql[index]) >= 128
+            ):
+                index += 1
+            lexical_tokens.append(("identifier", sql[start:index].casefold()))
+            continue
+        if char in {".", "(", ")", ",", ";"}:
+            lexical_tokens.append(("punctuation", char))
+        index += 1
+
+    identifiers = [
+        value for kind, value in lexical_tokens if kind == "identifier"
+    ]
+    conflict_actions = {"rollback", "abort", "fail", "ignore", "replace"}
+    for token_index, (kind, value) in enumerate(lexical_tokens):
+        if kind != "single":
+            continue
+        previous = token_index - 1
+        while previous >= 0 and lexical_tokens[previous] == ("punctuation", "("):
+            previous -= 1
+        if previous >= 1 and lexical_tokens[previous] == ("punctuation", "."):
+            previous -= 2  # Skip the schema identifier and its separator.
+            while previous >= 0 and lexical_tokens[previous] == ("punctuation", "("):
+                previous -= 1
+        context = lexical_tokens[previous] if previous >= 0 else None
+        is_table_context = context in {
+            ("identifier", "from"),
+            ("identifier", "join"),
+            ("identifier", "into"),
+            ("identifier", "update"),
+        }
+        if (
+            not is_table_context
+            and context is not None
+            and context[0] == "identifier"
+            and context[1] in conflict_actions
+            and previous >= 2
+        ):
+            is_table_context = (
+                lexical_tokens[previous - 1] == ("identifier", "or")
+                and lexical_tokens[previous - 2] == ("identifier", "update")
+            )
+        if is_table_context:
+            identifiers.append(value)
+    return tuple(identifiers)
+
+
+def _validate_phase2_program_hints_has_no_external_sql_dependencies(
+    conn: sqlite3.Connection,
+) -> None:
+    """Reject views/triggers whose owner or SQL depends on the renamed table."""
+    objects = conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master "
+        "WHERE type IN ('view','trigger')"
+    ).fetchall()
+    for schema_object in objects:
+        try:
+            identifiers = _sqlite_sql_identifier_tokens(schema_object["sql"])
+        except ValueError as exc:
+            raise RuntimeError(
+                "program_hints Phase2 migration blocked by malformed external "
+                "view or trigger"
+            ) from exc
+        trigger_owns_table = (
+            schema_object["type"] == "trigger"
+            and isinstance(schema_object["tbl_name"], str)
+            and schema_object["tbl_name"].casefold() == "program_hints"
+        )
+        if trigger_owns_table or "program_hints" in identifiers:
+            raise RuntimeError(
+                "program_hints Phase2 migration blocked by external view or trigger"
+            )
+
+
+def _validate_program_hints_phase2_removed(conn: sqlite3.Connection) -> None:
+    """Prove the temporary predecessor name did not leak before commit."""
+    legacy = "program_hints_phase2"
+    for schema_object in conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master"
+    ):
+        if schema_object["name"].casefold() == legacy:
+            raise RuntimeError("program_hints Phase2 migration left a legacy object")
+        if (
+            schema_object["type"] == "trigger"
+            and isinstance(schema_object["tbl_name"], str)
+            and schema_object["tbl_name"].casefold() == legacy
+        ):
+            raise RuntimeError("program_hints Phase2 migration left a legacy trigger owner")
+        if schema_object["sql"] is not None:
+            try:
+                identifiers = _sqlite_sql_identifier_tokens(schema_object["sql"])
+            except ValueError as exc:
+                raise RuntimeError(
+                    "program_hints Phase2 migration could not verify schema SQL"
+                ) from exc
+            if legacy in identifiers:
+                raise RuntimeError(
+                    "program_hints Phase2 migration left a legacy SQL reference"
+                )
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+    for row in tables:
+        table = row["name"]
+        quoted_table = '"' + table.replace('"', '""') + '"'
+        if any(
+            foreign_key["table"].casefold() == legacy
+            for foreign_key in conn.execute(f"PRAGMA foreign_key_list({quoted_table})")
+        ):
+            raise RuntimeError("program_hints Phase2 migration left a legacy foreign key")
+
+
+def _program_control_statement(prefix: str) -> str:
+    statement = ""
+    for line in _PROGRAM_CONTROL_SCHEMA_SQL.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.lstrip().casefold().startswith(prefix.casefold()):
+                return statement
+            statement = ""
+    raise RuntimeError(f"missing canonical schema statement: {prefix}")
+
+
+def _migrate_phase2_program_hints(conn: sqlite3.Connection) -> None:
+    if not _program_hints_is_phase2(conn):
+        return
+    _validate_phase2_program_hint_rows(conn)
+    _validate_phase2_program_hints_has_no_inbound_foreign_keys(conn)
+    _validate_phase2_program_hints_temporary_name_available(conn)
+    _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
+    columns = tuple(row["name"] for row in conn.execute("PRAGMA table_xinfo(program_hints)"))
+    quoted_columns = ", ".join(f'"{column}"' for column in columns)
+    with write_txn(conn):
+        # Recheck under the write lock, closing the preflight-to-migration gap.
+        if not _program_hints_is_phase2(conn):
+            raise RuntimeError("program_hints schema changed during Phase2 migration")
+        _validate_phase2_program_hint_rows(conn)
+        _validate_phase2_program_hints_has_no_inbound_foreign_keys(conn)
+        _validate_phase2_program_hints_temporary_name_available(conn)
+        _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
+        conn.execute("ALTER TABLE program_hints RENAME TO program_hints_phase2")
+        conn.execute("DROP INDEX idx_program_hints_node_state")
+        conn.execute(_program_control_statement("CREATE TABLE IF NOT EXISTS program_hints"))
+        conn.execute(
+            f"INSERT INTO program_hints ({quoted_columns}) "
+            f"SELECT {quoted_columns} FROM program_hints_phase2"
+        )
+        conn.execute("DROP TABLE program_hints_phase2")
+        conn.execute(_program_control_statement(
+            "CREATE INDEX IF NOT EXISTS idx_program_hints_node_state"
+        ))
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("program_hints Phase2 migration violated foreign keys")
+        _validate_program_hints_phase2_removed(conn)
+
+
 def _program_control_named_indexes(conn: sqlite3.Connection) -> tuple:
     names = ("idx_tasks_program_lineage", "idx_program_decisions_node",
              "idx_program_affected_node", "idx_program_hints_node_state")
@@ -2668,10 +3016,16 @@ def _canonical_program_control_named_indexes(*, include_run_parent: bool = True)
     return _program_control_named_indexes(reference)
 
 
-def _validate_program_control_table(conn: sqlite3.Connection, table: str) -> None:
+def _validate_program_control_table(
+    conn: sqlite3.Connection, table: str, *, allow_phase2_hints: bool = False
+) -> None:
     actual = _program_control_shape(conn, table)
     expected = _canonical_program_control_shapes()[table]
-    if actual != expected:
+    if actual != expected and not (
+        allow_phase2_hints
+        and table == "program_hints"
+        and actual == _phase2_program_hints_shape()
+    ):
         raise RuntimeError(f"{table} schema is incomplete or incompatible")
 
 
@@ -2695,7 +3049,12 @@ def _validate_existing_program_control_schema(conn: sqlite3.Connection) -> None:
     for table in _PROGRAM_CONTROL_COLUMNS:
         if table not in existing:
             continue
-        _validate_program_control_table(conn, table)
+        _validate_program_control_table(conn, table, allow_phase2_hints=True)
+        if table == "program_hints" and _program_hints_is_phase2(conn):
+            _validate_phase2_program_hint_rows(conn)
+            _validate_phase2_program_hints_has_no_inbound_foreign_keys(conn)
+            _validate_phase2_program_hints_temporary_name_available(conn)
+            _validate_phase2_program_hints_has_no_external_sql_dependencies(conn)
     if existing.intersection(_PROGRAM_CONTROL_COLUMNS) and (
         _program_control_named_indexes(conn) != _canonical_program_control_named_indexes(
             include_run_parent=_has_canonical_task_runs_parent(conn)
@@ -3966,9 +4325,20 @@ def _end_run(
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
+    terminal = conn.execute(
+        "SELECT status IN ('done','blocked','archived') FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    terminal_task = bool(terminal and terminal[0])
     if not row or not row["current_run_id"]:
+        _finalize_program_hints_locked(
+            conn, task_id, run_id=None, terminal_task=terminal_task, now=now,
+        )
         return None
     run_id = int(row["current_run_id"])
+    _finalize_program_hints_locked(
+        conn, task_id, run_id=run_id, terminal_task=terminal_task, now=now,
+    )
     conn.execute(
         """
         UPDATE task_runs
@@ -3998,6 +4368,53 @@ def _end_run(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
     return run_id
+
+
+def _append_hint_event_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    hint_id: str,
+    state: str,
+    *,
+    run_id: Optional[int] = None,
+    reason_code: Optional[str] = None,
+) -> None:
+    """Emit lifecycle metadata only; hint authority and prose stay private."""
+    payload = {"hint_id": hint_id, "node_id": task_id, "run_id": run_id,
+               "state": state, "reason_code": reason_code}
+    _append_event(conn, task_id, "hint_" + state, payload, run_id=run_id)
+
+
+def _finalize_program_hints_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    terminal_task: bool,
+    now: Optional[int] = None,
+) -> int:
+    """Close undelivered/delivered hints during termination; caller owns txn."""
+    terminal_at = int(time.time()) if now is None else now
+    rows = conn.execute(
+        "SELECT root_id,hint_id,state,run_id FROM program_hints WHERE node_id=? "
+        "AND (state='seen' OR (? AND state='recorded')) ORDER BY created_at,hint_id",
+        (task_id, terminal_task),
+    ).fetchall()
+    changed = 0
+    for row in rows:
+        target = "deferred" if row["state"] == "recorded" else "reconcile"
+        reason = "terminal_before_delivery" if target == "deferred" else "stale_seen"
+        cur = conn.execute(
+            "UPDATE program_hints SET state=?,terminal_at=?,terminal_reason_code=? "
+            "WHERE root_id=? AND node_id=? AND hint_id=? AND state=?",
+            (target, terminal_at, reason, row["root_id"], task_id,
+             row["hint_id"], row["state"]),
+        )
+        if cur.rowcount:
+            _append_hint_event_locked(conn, task_id, row["hint_id"], target,
+                                      run_id=row["run_id"], reason_code=reason)
+            changed += 1
+    return changed
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
@@ -4270,6 +4687,10 @@ def _block_expired_program_task(
             conn, task_id, outcome="timed_out", status="timed_out",
             error=reason, metadata={"reason": reason},
         )
+    else:
+        _finalize_program_hints_locked(
+            conn, task_id, run_id=None, terminal_task=True, now=now,
+        )
     if cur.rowcount == 1:
         _append_event(conn, task_id, "blocked", {"reason": reason})
     return cur.rowcount == 1
@@ -4347,6 +4768,10 @@ def claim_task(
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
+            _finalize_program_hints_locked(
+                conn, task_id, run_id=int(stale["current_run_id"]),
+                terminal_task=False, now=now,
+            )
             conn.execute(
                 """
                 UPDATE task_runs
@@ -6014,6 +6439,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
+            _finalize_program_hints_locked(
+                conn, task_id, run_id=int(stale["current_run_id"]),
+                terminal_task=False, now=now,
+            )
             conn.execute(
                 """
                 UPDATE task_runs
@@ -8009,6 +8438,10 @@ def _record_task_failure(
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
                     },
+                )
+            else:
+                _finalize_program_hints_locked(
+                    conn, task_id, run_id=None, terminal_task=True,
                 )
             payload = {
                 "failures": failures,

@@ -450,12 +450,6 @@ def test_arbitrary_legacy_additive_migration_and_partial_drift_fails_closed(tmp_
     path = tmp_path / "legacy.db"
     conn = sqlite3.connect(path)
     conn.executescript(kb.SCHEMA_SQL)
-    for table in ("program_decision_options", "program_decision_affected_nodes",
-                  "program_hints", "program_control_requests", "program_decisions"):
-        conn.execute(f"DROP TABLE {table}")
-    conn.execute("DROP INDEX IF EXISTS idx_program_decisions_node")
-    conn.execute("DROP INDEX IF EXISTS idx_program_affected_node")
-    conn.execute("DROP INDEX IF EXISTS idx_program_hints_node_state")
     conn.execute("ALTER TABLE tasks DROP COLUMN program_control_version")
     conn.execute("INSERT INTO tasks (id,title,status,created_at) VALUES ('legacy', 'Legacy', 'done', 1)")
     conn.commit(); conn.close()
@@ -464,7 +458,9 @@ def test_arbitrary_legacy_additive_migration_and_partial_drift_fails_closed(tmp_
         assert migrated.execute("SELECT program_control_version FROM tasks WHERE id='legacy'").fetchone()[0] == 0
     drift = tmp_path / "drift.db"
     conn = sqlite3.connect(drift)
+    conn.row_factory = sqlite3.Row
     conn.executescript(kb.SCHEMA_SQL)
+    kb._create_program_control_schema(conn)
     conn.execute("DROP TABLE program_hints")
     conn.execute("CREATE TABLE program_hints (root_id TEXT PRIMARY KEY)")
     conn.commit(); conn.close()
@@ -766,11 +762,11 @@ def test_hint_run_must_belong_to_the_same_node(board):
         ).lastrowid
         insert = (
             "INSERT INTO program_hints(root_id,hint_id,node_id,text,actor,idempotency_key,"
-            "expected_node_version,committed_node_version,state,run_id,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+            "expected_node_version,committed_node_version,state,run_id,claim_lock,profile,"
+            "created_at,delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         )
         values = [root, "same-node", child, "x", "control:owner", "same-node", 0, 1,
-                  "recorded", child_run, 1]
+                  "seen", child_run, "lock", "worker", 1, 1]
         conn.execute(insert, values)
         for hint_id, run_id in (("cross-node", other_run), ("missing-run", 999999)):
             values[1] = values[5] = hint_id
