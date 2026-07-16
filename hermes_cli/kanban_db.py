@@ -2086,6 +2086,12 @@ def _fd_signature(fd: int) -> tuple[int, ...]:
     )
 
 
+def _fd_identity(fd: int) -> tuple[int, ...]:
+    """Stable identity for pinned directories; sibling churn is irrelevant."""
+    stat = os.fstat(fd)
+    return stat.st_dev, stat.st_ino, stat.st_mode, stat.st_uid, stat.st_gid
+
+
 def _capability_open_chain(path: Path) -> tuple[list[int], list[tuple[int, ...]]]:
     """Pin every directory from the filesystem root through ``path``."""
     opath = getattr(os, "O_PATH", None)
@@ -2102,12 +2108,12 @@ def _capability_open_chain(path: Path) -> tuple[list[int], list[tuple[int, ...]]
         raise RuntimeError("safe descriptor-relative filesystem access unavailable")
     flags = opath | directory | nofollow | noatime
     fds = [os.open(path.anchor, flags)]
-    signatures = [_fd_signature(fds[0])]
+    signatures = [_fd_identity(fds[0])]
     try:
         for part in path.parts[1:]:
             fd = os.open(part, flags, dir_fd=fds[-1])
             fds.append(fd)
-            signatures.append(_fd_signature(fd))
+            signatures.append(_fd_identity(fd))
         return fds, signatures
     except BaseException:
         for fd in reversed(fds):

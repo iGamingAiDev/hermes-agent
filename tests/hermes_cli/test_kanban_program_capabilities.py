@@ -78,10 +78,16 @@ def _ancestor_stats(path: Path):
     for part in path.parent.parts[1:]:
         current /= part
         ancestors.append(current)
-    # Parallel pytest workers legitimately create/remove siblings under shared
-    # ancestors such as /tmp, changing mtime/ctime/nlink. The capability
-    # contract is specifically no-atime access, so assert that invariant only.
-    return {ancestor: ancestor.stat().st_atime_ns for ancestor in ancestors}
+    # Shared ancestors such as /tmp are intentionally active during the
+    # repository-wide parallel suite. Attribute no-atime assertions only to
+    # this test's private Hermes subtree; chain identity is tested separately.
+    private = False
+    result = {}
+    for ancestor in ancestors:
+        private = private or ancestor.name == ".hermes"
+        if private:
+            result[ancestor] = ancestor.stat().st_atime_ns
+    return result
 
 
 def test_capabilities_exact_repeatable_read_only_success(current_board, capsys):
@@ -95,6 +101,29 @@ def test_capabilities_exact_repeatable_read_only_success(current_board, capsys):
     assert _ancestor_stats(path) == ancestor_before
     payload = json.loads(SUCCESS)
     assert all(type(value) is int for value in list(payload.values())[2:])
+
+
+def test_capability_ignores_unrelated_sibling_churn_in_pinned_ancestor(
+    current_board, monkeypatch, capsys
+):
+    path = kb.kanban_db_path(board="alpha")
+    original_copy = kb._copy_capability_fd
+    churned = False
+
+    def copy_with_sibling_churn(source_fd, target):
+        nonlocal churned
+        if not churned:
+            sibling = path.parent.parent / "unrelated-capability-churn"
+            sibling.write_text("unrelated", encoding="utf-8")
+            sibling.unlink()
+            churned = True
+        return original_copy(source_fd, target)
+
+    monkeypatch.setattr(kb, "_copy_capability_fd", copy_with_sibling_churn)
+    assert _run(
+        ["kanban", "--board", "alpha", "program", "capabilities", "--json"], capsys
+    ) == (0, SUCCESS, "")
+    assert churned
 
 
 @pytest.mark.parametrize(
