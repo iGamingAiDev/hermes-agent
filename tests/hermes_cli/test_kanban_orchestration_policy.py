@@ -5,6 +5,546 @@ import json
 import pytest
 
 
+VALID_MISSION_CONTROL_CGROUP = (
+    b"0::/system.slice/vigo-mc-command-0123456789abcdef01.service\n"
+)
+REAL_MISSION_CONTROL_CGROUP_PROOF = kb.is_mission_control_command_cgroup
+
+
+@pytest.fixture(autouse=True)
+def allow_managed_roots_in_policy_tests(monkeypatch):
+    """These tests intentionally construct roots; production stays fail-closed."""
+    monkeypatch.setattr(kb, "is_mission_control_command_cgroup", lambda: True)
+
+
+def _policy(**overrides):
+    values = {
+        "allowed_assignees": ("planner", "worker"),
+        "orchestrator_assignees": ("planner",),
+        "max_depth": 2,
+        "max_tasks": 8,
+        "max_runtime_seconds": 60,
+        "max_concurrency": 2,
+        "max_wall_clock_seconds": 300,
+        "goal_max_turns": 5,
+    }
+    values.update(overrides)
+    return kb.OrchestrationPolicy(**values)
+
+
+def test_policy_v2_added_fields_are_strict_and_canonical():
+    policy = _policy()
+    encoded = json.loads(policy.to_json())
+    assert encoded == {
+        "version": 2,
+        "allowed_assignees": ["planner", "worker"],
+        "orchestrator_assignees": ["planner"],
+        "max_depth": 2,
+        "max_tasks": 8,
+        "max_runtime_seconds": 60,
+        "max_concurrency": 2,
+        "max_wall_clock_seconds": 300,
+        "goal_max_turns": 5,
+    }
+    assert kb.OrchestrationPolicy.from_json(policy.to_json()) == policy
+
+    for field, bad in (
+        ("max_concurrency", True),
+        ("max_concurrency", 1.0),
+        ("max_concurrency", "1"),
+        ("max_wall_clock_seconds", False),
+        ("goal_max_turns", 2.0),
+    ):
+        payload = dict(encoded)
+        payload[field] = bad
+        with pytest.raises(ValueError, match="malformed orchestration policy"):
+            kb.OrchestrationPolicy.from_json(json.dumps(payload))
+
+    for field, bad in (
+        ("max_concurrency", 0), ("max_concurrency", 33),
+        ("max_wall_clock_seconds", 0), ("max_wall_clock_seconds", 86401),
+        ("goal_max_turns", 0), ("goal_max_turns", 21),
+    ):
+        with pytest.raises(ValueError):
+            _policy(**{field: bad})
+
+
+def test_policy_a1_json_has_deliberate_bounded_upgrade():
+    a1 = json.dumps({
+        "allowed_assignees": ["planner"],
+        "orchestrator_assignees": ["planner"],
+        "max_depth": 1,
+        "max_tasks": 2,
+        "max_runtime_seconds": 3,
+    })
+    upgraded = kb.OrchestrationPolicy.from_json(a1)
+    assert upgraded.max_concurrency == 1
+    assert upgraded.max_wall_clock_seconds == 86400
+    assert upgraded.goal_max_turns == 20
+    assert json.loads(upgraded.to_json())["version"] == 2
+
+
+def test_policy_a1_root_replay_compares_upgraded_policy_semantics(tmp_path):
+    a1 = json.dumps(
+        {
+            "allowed_assignees": ["planner"],
+            "orchestrator_assignees": ["planner"],
+            "max_depth": 1,
+            "max_tasks": 2,
+            "max_runtime_seconds": 3,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    upgraded = kb.OrchestrationPolicy.from_json(a1)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(
+            conn,
+            title="root",
+            assignee="planner",
+            idempotency_key="a1-root",
+            orchestration_policy=upgraded,
+        )
+        conn.execute(
+            "UPDATE tasks SET orchestration_policy = ?, program_create_fingerprint = NULL WHERE id = ?",
+            (a1, root),
+        )
+        replay = kb.create_task(
+            conn,
+            title="root replay",
+            assignee="planner",
+            idempotency_key="a1-root",
+            orchestration_policy=upgraded,
+        )
+        assert replay == root
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_policy_child_inherits_goal_turn_budget(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(conn, title="root", assignee="planner", orchestration_policy=_policy())
+        authority = _claim_authority(conn, root)
+        child = _bounded_create(
+            conn, authority, title="child", assignee="worker", goal_mode=True,
+            goal_max_turns=20,
+        )
+        assert kb.get_task(conn, child).goal_max_turns == 5
+    finally:
+        conn.close()
+
+
+def test_policy_root_assignee_must_be_an_orchestrator(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        with pytest.raises(ValueError, match="root assignee"):
+            kb.create_task(
+                conn,
+                title="unusable root",
+                assignee="worker",
+                orchestration_policy=_policy(),
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_program_deadline_rejects_create_and_claim_but_allows_exact_replay(tmp_path, monkeypatch):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(conn, title="root", assignee="planner", orchestration_policy=_policy(max_wall_clock_seconds=10))
+        authority = _claim_authority(conn, root)
+        child = _bounded_create(conn, authority, title="child", assignee="worker", idempotency_key="child-key")
+        monkeypatch.setattr(kb.time, "time", lambda: now + 10)
+        assert _bounded_create(conn, authority, title="child", assignee="worker", idempotency_key="child-key") == child
+        with pytest.raises(ValueError, match="idempotency"):
+            _bounded_create(conn, authority, title="changed", assignee="worker", idempotency_key="child-key")
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ValueError, match="deadline"):
+            _bounded_create(conn, authority, title="late", assignee="worker", idempotency_key="new-key")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+        kb.complete_task(conn, root, result="delegated", expected_run_id=authority.run_id)
+        assert kb.claim_task(conn, child) is None
+        expired_child = kb.get_task(conn, child)
+        assert expired_child is not None
+        assert expired_child.status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        expired_child = kb.get_task(conn, child)
+        assert expired_child is not None
+        assert expired_child.status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_program_deadline_terminates_running_worker_without_requeue(tmp_path, monkeypatch):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(
+            conn,
+            title="root",
+            assignee="planner",
+            orchestration_policy=_policy(
+                max_runtime_seconds=3600,
+                max_wall_clock_seconds=10,
+            ),
+        )
+        claimed = kb.claim_task(conn, root, claimer=f"{kb._claimer_id().split(':', 1)[0]}:deadline")
+        assert claimed is not None
+        conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (999999, root))
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+            (999999, claimed.current_run_id),
+        )
+        monkeypatch.setattr(kb.time, "time", lambda: now + 10)
+        signals = []
+        assert kb.enforce_max_runtime(
+            conn,
+            signal_fn=lambda pid, sig: signals.append((pid, sig)),
+        ) == [root]
+        assert signals
+        task = kb.get_task(conn, root)
+        assert task is not None
+        assert task.status == "blocked"
+        run = kb.latest_run(conn, root)
+        assert run is not None
+        assert run.status == "timed_out"
+        assert run.outcome == "timed_out"
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, root)
+        assert task is not None
+        assert task.status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_program_max_concurrency_is_atomic_and_ignores_ended_runs(tmp_path):
+    path = tmp_path / "kanban.db"
+    conn = kb.connect(path)
+    try:
+        root = kb.create_task(conn, title="root", assignee="planner", orchestration_policy=_policy(max_concurrency=1))
+        authority = _claim_authority(conn, root)
+        first = _bounded_create(conn, authority, title="first", assignee="worker")
+        second = _bounded_create(conn, authority, title="second", assignee="worker")
+        kb.complete_task(conn, root, result="delegated", expected_run_id=authority.run_id)
+    finally:
+        conn.close()
+
+    barrier = threading.Barrier(2)
+    def claim(task_id):
+        c = kb.connect(path)
+        try:
+            barrier.wait()
+            return kb.claim_task(c, task_id)
+        finally:
+            c.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, (first, second)))
+    assert sum(result is not None for result in results) == 1
+
+    winner = next(result for result in results if result is not None)
+    loser = second if winner.id == first else first
+    conn = kb.connect(path)
+    try:
+        conn.execute(
+            "UPDATE task_runs SET claim_expires=? WHERE id=?",
+            (int(kb.time.time()) - 1, winner.current_run_id),
+        )
+        # Lease expiry alone is not a release. The run remains authoritative
+        # until the reclaim/termination path closes it.
+        assert kb.claim_task(conn, loser) is None
+        assert kb.reclaim_task(conn, winner.id, reason="expired test run")
+        assert kb.claim_task(conn, loser) is not None
+        loser_task = kb.get_task(conn, loser)
+        assert kb.complete_task(
+            conn, loser, result="done", expected_run_id=loser_task.current_run_id
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL WHERE id=?",
+            (loser,),
+        )
+        assert kb.claim_task(conn, loser) is not None
+    finally:
+        conn.close()
+
+
+def test_managed_assignment_rejects_profiles_outside_policy(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(
+            conn, title="root", assignee="planner", orchestration_policy=_policy()
+        )
+        with pytest.raises(ValueError, match="allowed_assignees"):
+            kb.assign_task(conn, root, "outsider")
+        with pytest.raises(ValueError, match="allowed_assignees"):
+            kb.assign_task(conn, root, None)
+        assert kb.get_task(conn, root).assignee == "planner"
+        assert kb.assign_task(conn, root, "worker")
+    finally:
+        conn.close()
+
+
+def test_managed_reassign_rejects_before_reclaiming_active_run(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(
+            conn, title="root", assignee="planner", orchestration_policy=_policy()
+        )
+        claimed = kb.claim_task(conn, root)
+        assert claimed is not None
+        with pytest.raises(ValueError, match="allowed_assignees"):
+            kb.reassign_task(conn, root, "outsider", reclaim_first=True)
+        task = kb.get_task(conn, root)
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
+        assert kb.latest_run(conn, root).ended_at is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("mismatch", ["root", "tenant", "project", "unmanaged"])
+def test_managed_links_must_stay_in_exact_program_scope(tmp_path, mismatch):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        policy = _policy()
+        root = kb.create_task(
+            conn, title="root", assignee="planner", tenant="tenant-a",
+            orchestration_policy=policy,
+        )
+        conn.execute("UPDATE tasks SET project_id='project-a' WHERE id=?", (root,))
+        authority = _claim_authority(conn, root)
+        child = _bounded_create(conn, authority, title="child", assignee="worker")
+        other = kb.create_task(conn, title="other", assignee="planner")
+        if mismatch == "root":
+            other = kb.create_task(
+                conn, title="other root", assignee="planner", tenant="tenant-a",
+                orchestration_policy=policy,
+            )
+            conn.execute("UPDATE tasks SET project_id='project-a' WHERE id=?", (other,))
+        elif mismatch == "tenant":
+            conn.execute(
+                "UPDATE tasks SET orchestration_root_id=?, orchestration_policy=?, "
+                "orchestration_depth=1, tenant='tenant-b', project_id='project-a' WHERE id=?",
+                (root, policy.to_json(), other),
+            )
+        elif mismatch == "project":
+            conn.execute(
+                "UPDATE tasks SET orchestration_root_id=?, orchestration_policy=?, "
+                "orchestration_depth=1, tenant='tenant-a', project_id='project-b' WHERE id=?",
+                (root, policy.to_json(), other),
+            )
+        with pytest.raises(ValueError, match="orchestration scope"):
+            kb.link_tasks(conn, other, child)
+        assert other not in kb.parent_ids(conn, child)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("modes", [("normal", "review"), ("review", "review")])
+def test_program_admission_is_atomic_for_review_and_normal_claims(tmp_path, modes):
+    path = tmp_path / "kanban.db"
+    conn = kb.connect(path)
+    try:
+        root = kb.create_task(conn, title="root", assignee="planner", orchestration_policy=_policy(max_concurrency=1))
+        authority = _claim_authority(conn, root)
+        tasks = [_bounded_create(conn, authority, title=f"task-{i}", assignee="worker") for i in range(2)]
+        kb.complete_task(conn, root, result="delegated", expected_run_id=authority.run_id)
+        for task_id, mode in zip(tasks, modes):
+            if mode == "review":
+                conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+    finally:
+        conn.close()
+
+    barrier = threading.Barrier(2)
+    def claim(item):
+        task_id, mode = item
+        c = kb.connect(path)
+        try:
+            barrier.wait()
+            return (kb.claim_review_task if mode == "review" else kb.claim_task)(c, task_id)
+        finally:
+            c.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, zip(tasks, modes)))
+    assert sum(result is not None for result in results) == 1
+
+
+def test_program_deadline_blocks_heartbeat_and_stale_release_at_boundary(tmp_path, monkeypatch):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(conn, title="root", assignee="planner", orchestration_policy=_policy(max_wall_clock_seconds=10))
+        claimed = kb.claim_task(conn, root, claimer=f"{kb._claimer_id().split(':', 1)[0]}:deadline")
+        conn.execute("UPDATE tasks SET worker_pid=?, claim_expires=? WHERE id=?", (123, now + 1, root))
+        monkeypatch.setattr(kb.time, "time", lambda: now + 10)
+        assert kb.heartbeat_claim(conn, root, claimer=claimed.claim_lock) is False
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_: None) == 0
+        task = kb.get_task(conn, root)
+        assert task.status == "blocked"
+        assert task.claim_expires is None
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, root).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_heartbeat_worker_blocks_expired_program_without_heartbeat_mutation(
+    tmp_path, monkeypatch,
+):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(
+            conn,
+            title="root",
+            assignee="planner",
+            orchestration_policy=_policy(max_wall_clock_seconds=10),
+        )
+        claimed = kb.claim_task(conn, root)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at=? WHERE id=?", (now + 3, root)
+        )
+        conn.execute(
+            "UPDATE task_runs SET last_heartbeat_at=? WHERE id=?",
+            (now + 4, claimed.current_run_id),
+        )
+        heartbeat_events_before = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='heartbeat'",
+            (root,),
+        ).fetchone()[0]
+
+        monkeypatch.setattr(kb.time, "time", lambda: now + 10)
+        assert kb.heartbeat_worker(
+            conn, root, note="too late", expected_run_id=claimed.current_run_id
+        ) is False
+
+        task = kb.get_task(conn, root)
+        assert task.status == "blocked"
+        assert task.last_heartbeat_at is None
+        run = kb.latest_run(conn, root)
+        assert run.status == "timed_out"
+        assert run.last_heartbeat_at == now + 4
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='heartbeat'",
+            (root,),
+        ).fetchone()[0] == heartbeat_events_before
+    finally:
+        conn.close()
+
+
+def test_heartbeat_worker_legacy_task_ignores_program_deadline_check(
+    tmp_path, monkeypatch,
+):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(conn, title="legacy", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        monkeypatch.setattr(kb.time, "time", lambda: now + 100_000)
+
+        assert kb.heartbeat_worker(
+            conn, task_id, expected_run_id=claimed.current_run_id
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.last_heartbeat_at == now + 100_000
+        assert kb.latest_run(conn, task_id).last_heartbeat_at == now + 100_000
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='heartbeat'",
+            (task_id,),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_expired_program_stale_claim_is_blocked_not_extended_or_requeued(tmp_path, monkeypatch):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(conn, title="root", assignee="planner", orchestration_policy=_policy(max_wall_clock_seconds=10))
+        claimed = kb.claim_task(conn, root)
+        conn.execute("UPDATE tasks SET worker_pid=?, claim_expires=? WHERE id=?", (123, now + 1, root))
+        monkeypatch.setattr(kb.time, "time", lambda: now + 10)
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_: None) == 1
+        task = kb.get_task(conn, root)
+        assert task.status == "blocked"
+        assert task.claim_expires is None
+        assert kb.latest_run(conn, root).ended_at is not None
+        assert kb.recompute_ready(conn) == 0
+    finally:
+        conn.close()
+
+
+def test_managed_idempotency_fingerprint_migrates_and_rejects_changed_request(tmp_path):
+    path = tmp_path / "kanban.db"
+    conn = kb.connect(path)
+    conn.execute("ALTER TABLE tasks DROP COLUMN program_create_fingerprint")
+    conn.close()
+    kb.init_db(path)
+    conn = kb.connect(path)
+    try:
+        assert "program_create_fingerprint" in {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        root = kb.create_task(conn, title="root", body="body", assignee="planner", idempotency_key="root-fp", orchestration_policy=_policy())
+        assert kb.create_task(conn, title="root", body="body", assignee="planner", idempotency_key="root-fp", orchestration_policy=_policy()) == root
+        for changed in ({"title": "other", "body": "body"}, {"title": "root", "body": "other"}, {"title": "root", "body": "body", "priority": 1}):
+            with pytest.raises(ValueError, match="idempotency"):
+                kb.create_task(conn, assignee="planner", idempotency_key="root-fp", orchestration_policy=_policy(), **changed)
+    finally:
+        conn.close()
+
+
+def test_managed_exact_idempotent_replay_is_atomic(tmp_path):
+    path = tmp_path / "kanban.db"
+    kb.init_db(path)
+    barrier = threading.Barrier(2)
+
+    def create():
+        conn = kb.connect(path)
+        try:
+            barrier.wait()
+            return kb.create_task(
+                conn, title="same", body="same", assignee="planner",
+                idempotency_key="same-key", orchestration_policy=_policy(),
+            )
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: create(), range(2)))
+    assert results[0] == results[1]
+    with kb.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_legacy_unmanaged_claim_and_create_remain_unbounded(tmp_path, monkeypatch):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        parent = kb.create_task(conn, title="legacy", assignee="planner")
+        monkeypatch.setattr(kb.time, "time", lambda: now + 100_000)
+        assert kb.claim_task(conn, parent) is not None
+        child = kb.create_task(conn, title="legacy child", assignee="worker", current_orchestrator_task_id=parent)
+        assert kb.get_task(conn, child).orchestration_policy is None
+    finally:
+        conn.close()
+
+
 def _claim_authority(conn, task_id):
     claimed = kb.claim_task(conn, task_id, ttl_seconds=300)
     assert claimed is not None
@@ -23,6 +563,100 @@ def _bounded_create(conn, authority, **kwargs):
         creation_authority=authority,
         **kwargs,
     )
+
+
+def test_direct_root_requires_cgroup_and_forged_context_cannot_bypass(
+    tmp_path, monkeypatch,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    monkeypatch.setattr(kb, "is_mission_control_command_cgroup", lambda: False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "forged-root")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "forged-lock")
+    forged = kb.CreationAuthority(
+        task_id="forged-root",
+        run_id=1,
+        claim_lock="forged-lock",
+        actor_profile="planner",
+    )
+    try:
+        with pytest.raises(ValueError, match="Mission Control"):
+            kb.create_task(
+                conn,
+                title="forged root",
+                assignee="planner",
+                orchestration_policy=_policy(),
+                creation_authority=forged,
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_exact_cgroup_creates_root_and_child_authority_works_outside_cgroup(
+    tmp_path, monkeypatch,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    monkeypatch.setattr(kb, "_read_self_cgroup", lambda: VALID_MISSION_CONTROL_CGROUP)
+    # Exercise the real proof parser, not the module's root-construction fixture.
+    monkeypatch.setattr(
+        kb,
+        "is_mission_control_command_cgroup",
+        REAL_MISSION_CONTROL_CGROUP_PROOF,
+    )
+    try:
+        root = kb.create_task(
+            conn,
+            title="root",
+            assignee="planner",
+            orchestration_policy=_policy(),
+        )
+        authority = _claim_authority(conn, root)
+        monkeypatch.setattr(kb, "is_mission_control_command_cgroup", lambda: False)
+        child = _bounded_create(
+            conn, authority, title="child", assignee="worker"
+        )
+        assert kb.get_task(conn, child).orchestration_root_id == root
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_root_cgroup_proof_loss_inside_transaction_rejects_without_state(
+    tmp_path, monkeypatch, replay,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        existing = kb.create_task(
+            conn,
+            title="root",
+            assignee="planner",
+            idempotency_key="root-key",
+            orchestration_policy=_policy(),
+        )
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        proofs = iter((True, False))
+        monkeypatch.setattr(
+            kb, "is_mission_control_command_cgroup", lambda: next(proofs)
+        )
+
+        with pytest.raises(ValueError, match="Mission Control"):
+            kb.create_task(
+                conn,
+                title="root" if replay else "new root",
+                assignee="planner",
+                idempotency_key="root-key" if replay else "new-root-key",
+                orchestration_policy=_policy(),
+            )
+
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+        assert kb.get_task(conn, existing) is not None
+        if not replay:
+            assert conn.execute(
+                "SELECT 1 FROM tasks WHERE idempotency_key='new-root-key'"
+            ).fetchone() is None
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(
@@ -82,7 +716,7 @@ def test_policy_root_idempotency_is_scope_aware(tmp_path):
         )
         replay = kb.create_task(
             conn,
-            title="bounded root retry",
+            title="bounded root",
             assignee="planner",
             tenant="tenant-a",
             idempotency_key="root-key",
@@ -102,7 +736,7 @@ def test_policy_root_idempotency_is_scope_aware(tmp_path):
             {"orchestration_policy": policy, "tenant": "tenant-b", "assignee": "planner"},
             {"orchestration_policy": policy, "tenant": "tenant-a", "assignee": "worker"},
         ):
-            with pytest.raises(ValueError, match="idempotency key belongs to another program"):
+            with pytest.raises(ValueError, match="idempotency"):
                 kb.create_task(
                     conn,
                     title="conflicting root retry",
@@ -366,7 +1000,7 @@ def test_program_task_cap_is_atomic_and_idempotent_replay_is_free(tmp_path):
         winning_key = "child-a" if results[0].startswith("t_") else "child-b"
         replay = kb.create_task(
             conn,
-            title="ignored replay title",
+            title=winning_key,
             assignee="worker",
             current_orchestrator_task_id=root_id,
             creation_authority=authority,
