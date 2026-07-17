@@ -1316,6 +1316,31 @@ def test_link_rejects_cycle(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_link_tool_rejects_managed_to_unmanaged_scope(worker_env, monkeypatch):
+    """The model tool must inherit the DB's managed-program boundary."""
+    from hermes_cli import kanban_db as kb
+    monkeypatch.setattr(kb, "is_mission_control_command_cgroup", lambda: True)
+    policy = kb.OrchestrationPolicy(
+        allowed_assignees=("planner", "worker"),
+        orchestrator_assignees=("planner",),
+        max_depth=2,
+        max_tasks=4,
+        max_runtime_seconds=60,
+    )
+    with kb.connect_closing() as conn:
+        managed = kb.create_task(
+            conn, title="managed", assignee="planner", orchestration_policy=policy
+        )
+        unmanaged = kb.create_task(conn, title="unmanaged", assignee="worker")
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_link({
+        "parent_id": unmanaged, "child_id": managed,
+    }))
+    assert "orchestration scope" in out.get("error", "")
+    with kb.connect_closing() as conn:
+        assert unmanaged not in kb.parent_ids(conn, managed)
+
+
 def test_unblock_happy_path(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from hermes_cli import kanban_db as kb

@@ -2573,6 +2573,53 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_CGROUP_READ_LIMIT = 16 * 1024
+_MC_COMMAND_UNIT_RE = re.compile(r"vigo-mc-command-[0-9a-f]{18}\.service")
+
+
+def _read_self_cgroup() -> bytes:
+    """Read procfs with a hard cap; kept separate for test injection."""
+    with open("/proc/self/cgroup", "rb") as stream:
+        data = stream.read(_CGROUP_READ_LIMIT + 1)
+    if len(data) > _CGROUP_READ_LIMIT:
+        raise ValueError("oversized cgroup membership")
+    return data
+
+
+def is_mission_control_command_cgroup() -> bool:
+    """Prove membership in the broker's exact transient systemd unit."""
+    try:
+        raw = _read_self_cgroup()
+        if len(raw) > _CGROUP_READ_LIMIT:
+            return False
+        text = raw.decode("ascii")
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if not text or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        return False
+
+    proof_paths: list[str] = []
+    for line in text.splitlines():
+        match = re.fullmatch(r"([0-9]+):([^:]*):(/[^:]*)", line)
+        if match is None:
+            return False
+        hierarchy, controllers, path = match.groups()
+        if hierarchy == "0" and controllers == "":  # cgroup v2
+            proof_paths.append(path)
+        elif "name=systemd" in controllers.split(","):  # safe cgroup v1 proof
+            proof_paths.append(path)
+
+    if len(proof_paths) != 1:
+        return False
+    expected = re.fullmatch(
+        r"/system\.slice/(vigo-mc-command-[0-9a-f]{18}\.service)", proof_paths[0]
+    )
+    return (
+        expected is not None
+        and _MC_COMMAND_UNIT_RE.fullmatch(expected.group(1)) is not None
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2631,6 +2678,10 @@ def create_task(
         raise ValueError("orchestration_policy must be an OrchestrationPolicy")
     if orchestration_policy is not None and current_orchestrator_task_id is not None:
         raise ValueError("a child cannot supply orchestration policy authority")
+    if orchestration_policy is not None and not is_mission_control_command_cgroup():
+        raise ValueError(
+            "program root creation is restricted to the trusted Mission Control broker"
+        )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2916,6 +2967,14 @@ def create_task(
                         if policy is not None and existing["program_create_fingerprint"]:
                             if existing["program_create_fingerprint"] != program_create_fingerprint:
                                 raise ValueError("idempotency key request does not match")
+                            if (
+                                orchestration_policy is not None
+                                and not is_mission_control_command_cgroup()
+                            ):
+                                raise ValueError(
+                                    "program root creation is restricted to the trusted "
+                                    "Mission Control broker"
+                                )
                             return existing["id"]
                         if current_orchestrator_task_id is not None and policy is not None:
                             same_scope = (
@@ -2939,6 +2998,14 @@ def create_task(
                         if not same_scope:
                             raise ValueError(
                                 "idempotency key belongs to another program"
+                            )
+                        if (
+                            orchestration_policy is not None
+                            and not is_mission_control_command_cgroup()
+                        ):
+                            raise ValueError(
+                                "program root creation is restricted to the trusted "
+                                "Mission Control broker"
                             )
                         return existing["id"]
 
@@ -3028,6 +3095,14 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                if (
+                    orchestration_policy is not None
+                    and not is_mission_control_command_cgroup()
+                ):
+                    raise ValueError(
+                        "program root creation is restricted to the trusted "
+                        "Mission Control broker"
+                    )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3181,6 +3256,27 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def _validate_managed_assignee(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str],
+) -> None:
+    """Validate a managed-task assignment before any lifecycle mutation."""
+    row = conn.execute(
+        "SELECT orchestration_policy FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["orchestration_policy"] is None:
+        return
+    try:
+        policy = OrchestrationPolicy.from_json(row["orchestration_policy"])
+    except ValueError as exc:
+        raise ValueError(
+            "cannot reassign managed task: orchestration policy is invalid"
+        ) from exc
+    if profile not in policy.allowed_assignees:
+        raise ValueError(
+            "managed task assignee must be one of policy.allowed_assignees"
+        )
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
@@ -3190,7 +3286,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee "
+            "FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -3199,6 +3296,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        _validate_managed_assignee(conn, task_id, profile)
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
@@ -3225,6 +3323,27 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        scope_rows = conn.execute(
+            "SELECT id, orchestration_policy, orchestration_root_id, tenant, project_id "
+            "FROM tasks WHERE id IN (?, ?)",
+            (parent_id, child_id),
+        ).fetchall()
+        scopes = {row["id"]: row for row in scope_rows}
+        parent_scope = scopes[parent_id]
+        child_scope = scopes[child_id]
+        if (
+            parent_scope["orchestration_policy"] is not None
+            or child_scope["orchestration_policy"] is not None
+        ) and (
+            parent_scope["orchestration_root_id"]
+            != child_scope["orchestration_root_id"]
+            or parent_scope["tenant"] != child_scope["tenant"]
+            or parent_scope["project_id"] != child_scope["project_id"]
+        ):
+            raise ValueError(
+                "managed task links must stay within the same orchestration scope "
+                "(program root, tenant, and project)"
+            )
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
@@ -3838,8 +3957,8 @@ def _admit_program_run(
     active = conn.execute(
         "SELECT COUNT(*) FROM task_runs r JOIN tasks t ON t.id=r.task_id "
         "WHERE t.orchestration_root_id=? AND r.status='running' "
-        "AND r.ended_at IS NULL AND r.claim_expires >= ?",
-        (root_id, now),
+        "AND r.ended_at IS NULL",
+        (root_id,),
     ).fetchone()[0]
     return active < policy.max_concurrency
 
@@ -4327,6 +4446,10 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    profile = _canonical_assignee(profile)
+    # Validate before reclaiming/killing a running worker. A forbidden target
+    # must be a side-effect-free rejection, not a partial recovery operation.
+    _validate_managed_assignee(conn, task_id, profile)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -6769,6 +6892,10 @@ def heartbeat_worker(
     """
     now = int(time.time())
     with write_txn(conn):
+        _policy, _root_id, expired, reason = _program_deadline(conn, task_id, now)
+        if expired:
+            _block_expired_program_task(conn, task_id, now, reason)
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "

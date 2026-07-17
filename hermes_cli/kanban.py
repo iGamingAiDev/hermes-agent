@@ -907,6 +907,11 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
         return 0
 
+    # Reject before board resolution or DB initialization can read, create, or
+    # mutate any persistent state.
+    if action == "program" and not kb.is_mission_control_command_cgroup():
+        return _reject_program_create()
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1390,7 +1395,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reject_program_create() -> int:
+    print(
+        "kanban program create: restricted to the trusted Mission Control broker",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _cmd_program_create(args: argparse.Namespace) -> int:
+    """Create a program root only inside Mission Control's command unit."""
+    if not kb.is_mission_control_command_cgroup():
+        return _reject_program_create()
     try:
         policy = kb.OrchestrationPolicy(
             allowed_assignees=tuple(args.allowed_assignee),
@@ -1675,8 +1691,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.assign_task(conn, args.task_id, profile)
+    except ValueError as exc:
+        print(f"kanban assign: {exc}", file=sys.stderr)
+        return 2
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
@@ -1855,8 +1875,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        kb.link_tasks(conn, args.parent_id, args.child_id)
+    try:
+        with kb.connect_closing() as conn:
+            kb.link_tasks(conn, args.parent_id, args.child_id)
+    except ValueError as exc:
+        print(f"kanban link: {exc}", file=sys.stderr)
+        return 2
     print(f"Linked {args.parent_id} -> {args.child_id}")
     return 0
 

@@ -5,6 +5,18 @@ import json
 import pytest
 
 
+VALID_MISSION_CONTROL_CGROUP = (
+    b"0::/system.slice/vigo-mc-command-0123456789abcdef01.service\n"
+)
+REAL_MISSION_CONTROL_CGROUP_PROOF = kb.is_mission_control_command_cgroup
+
+
+@pytest.fixture(autouse=True)
+def allow_managed_roots_in_policy_tests(monkeypatch):
+    """These tests intentionally construct roots; production stays fail-closed."""
+    monkeypatch.setattr(kb, "is_mission_control_command_cgroup", lambda: True)
+
+
 def _policy(**overrides):
     values = {
         "allowed_assignees": ("planner", "worker"),
@@ -245,6 +257,10 @@ def test_program_max_concurrency_is_atomic_and_ignores_ended_runs(tmp_path):
             "UPDATE task_runs SET claim_expires=? WHERE id=?",
             (int(kb.time.time()) - 1, winner.current_run_id),
         )
+        # Lease expiry alone is not a release. The run remains authoritative
+        # until the reclaim/termination path closes it.
+        assert kb.claim_task(conn, loser) is None
+        assert kb.reclaim_task(conn, winner.id, reason="expired test run")
         assert kb.claim_task(conn, loser) is not None
         loser_task = kb.get_task(conn, loser)
         assert kb.complete_task(
@@ -255,6 +271,78 @@ def test_program_max_concurrency_is_atomic_and_ignores_ended_runs(tmp_path):
             (loser,),
         )
         assert kb.claim_task(conn, loser) is not None
+    finally:
+        conn.close()
+
+
+def test_managed_assignment_rejects_profiles_outside_policy(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(
+            conn, title="root", assignee="planner", orchestration_policy=_policy()
+        )
+        with pytest.raises(ValueError, match="allowed_assignees"):
+            kb.assign_task(conn, root, "outsider")
+        with pytest.raises(ValueError, match="allowed_assignees"):
+            kb.assign_task(conn, root, None)
+        assert kb.get_task(conn, root).assignee == "planner"
+        assert kb.assign_task(conn, root, "worker")
+    finally:
+        conn.close()
+
+
+def test_managed_reassign_rejects_before_reclaiming_active_run(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(
+            conn, title="root", assignee="planner", orchestration_policy=_policy()
+        )
+        claimed = kb.claim_task(conn, root)
+        assert claimed is not None
+        with pytest.raises(ValueError, match="allowed_assignees"):
+            kb.reassign_task(conn, root, "outsider", reclaim_first=True)
+        task = kb.get_task(conn, root)
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
+        assert kb.latest_run(conn, root).ended_at is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("mismatch", ["root", "tenant", "project", "unmanaged"])
+def test_managed_links_must_stay_in_exact_program_scope(tmp_path, mismatch):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        policy = _policy()
+        root = kb.create_task(
+            conn, title="root", assignee="planner", tenant="tenant-a",
+            orchestration_policy=policy,
+        )
+        conn.execute("UPDATE tasks SET project_id='project-a' WHERE id=?", (root,))
+        authority = _claim_authority(conn, root)
+        child = _bounded_create(conn, authority, title="child", assignee="worker")
+        other = kb.create_task(conn, title="other", assignee="planner")
+        if mismatch == "root":
+            other = kb.create_task(
+                conn, title="other root", assignee="planner", tenant="tenant-a",
+                orchestration_policy=policy,
+            )
+            conn.execute("UPDATE tasks SET project_id='project-a' WHERE id=?", (other,))
+        elif mismatch == "tenant":
+            conn.execute(
+                "UPDATE tasks SET orchestration_root_id=?, orchestration_policy=?, "
+                "orchestration_depth=1, tenant='tenant-b', project_id='project-a' WHERE id=?",
+                (root, policy.to_json(), other),
+            )
+        elif mismatch == "project":
+            conn.execute(
+                "UPDATE tasks SET orchestration_root_id=?, orchestration_policy=?, "
+                "orchestration_depth=1, tenant='tenant-a', project_id='project-b' WHERE id=?",
+                (root, policy.to_json(), other),
+            )
+        with pytest.raises(ValueError, match="orchestration scope"):
+            kb.link_tasks(conn, other, child)
+        assert other not in kb.parent_ids(conn, child)
     finally:
         conn.close()
 
@@ -305,6 +393,79 @@ def test_program_deadline_blocks_heartbeat_and_stale_release_at_boundary(tmp_pat
         assert task.claim_expires is None
         assert kb.recompute_ready(conn) == 0
         assert kb.get_task(conn, root).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_heartbeat_worker_blocks_expired_program_without_heartbeat_mutation(
+    tmp_path, monkeypatch,
+):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        root = kb.create_task(
+            conn,
+            title="root",
+            assignee="planner",
+            orchestration_policy=_policy(max_wall_clock_seconds=10),
+        )
+        claimed = kb.claim_task(conn, root)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at=? WHERE id=?", (now + 3, root)
+        )
+        conn.execute(
+            "UPDATE task_runs SET last_heartbeat_at=? WHERE id=?",
+            (now + 4, claimed.current_run_id),
+        )
+        heartbeat_events_before = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='heartbeat'",
+            (root,),
+        ).fetchone()[0]
+
+        monkeypatch.setattr(kb.time, "time", lambda: now + 10)
+        assert kb.heartbeat_worker(
+            conn, root, note="too late", expected_run_id=claimed.current_run_id
+        ) is False
+
+        task = kb.get_task(conn, root)
+        assert task.status == "blocked"
+        assert task.last_heartbeat_at is None
+        run = kb.latest_run(conn, root)
+        assert run.status == "timed_out"
+        assert run.last_heartbeat_at == now + 4
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='heartbeat'",
+            (root,),
+        ).fetchone()[0] == heartbeat_events_before
+    finally:
+        conn.close()
+
+
+def test_heartbeat_worker_legacy_task_ignores_program_deadline_check(
+    tmp_path, monkeypatch,
+):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(conn, title="legacy", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        monkeypatch.setattr(kb.time, "time", lambda: now + 100_000)
+
+        assert kb.heartbeat_worker(
+            conn, task_id, expected_run_id=claimed.current_run_id
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.last_heartbeat_at == now + 100_000
+        assert kb.latest_run(conn, task_id).last_heartbeat_at == now + 100_000
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='heartbeat'",
+            (task_id,),
+        ).fetchone()[0] == 1
     finally:
         conn.close()
 
@@ -402,6 +563,100 @@ def _bounded_create(conn, authority, **kwargs):
         creation_authority=authority,
         **kwargs,
     )
+
+
+def test_direct_root_requires_cgroup_and_forged_context_cannot_bypass(
+    tmp_path, monkeypatch,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    monkeypatch.setattr(kb, "is_mission_control_command_cgroup", lambda: False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "forged-root")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "forged-lock")
+    forged = kb.CreationAuthority(
+        task_id="forged-root",
+        run_id=1,
+        claim_lock="forged-lock",
+        actor_profile="planner",
+    )
+    try:
+        with pytest.raises(ValueError, match="Mission Control"):
+            kb.create_task(
+                conn,
+                title="forged root",
+                assignee="planner",
+                orchestration_policy=_policy(),
+                creation_authority=forged,
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_exact_cgroup_creates_root_and_child_authority_works_outside_cgroup(
+    tmp_path, monkeypatch,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    monkeypatch.setattr(kb, "_read_self_cgroup", lambda: VALID_MISSION_CONTROL_CGROUP)
+    # Exercise the real proof parser, not the module's root-construction fixture.
+    monkeypatch.setattr(
+        kb,
+        "is_mission_control_command_cgroup",
+        REAL_MISSION_CONTROL_CGROUP_PROOF,
+    )
+    try:
+        root = kb.create_task(
+            conn,
+            title="root",
+            assignee="planner",
+            orchestration_policy=_policy(),
+        )
+        authority = _claim_authority(conn, root)
+        monkeypatch.setattr(kb, "is_mission_control_command_cgroup", lambda: False)
+        child = _bounded_create(
+            conn, authority, title="child", assignee="worker"
+        )
+        assert kb.get_task(conn, child).orchestration_root_id == root
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_root_cgroup_proof_loss_inside_transaction_rejects_without_state(
+    tmp_path, monkeypatch, replay,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        existing = kb.create_task(
+            conn,
+            title="root",
+            assignee="planner",
+            idempotency_key="root-key",
+            orchestration_policy=_policy(),
+        )
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        proofs = iter((True, False))
+        monkeypatch.setattr(
+            kb, "is_mission_control_command_cgroup", lambda: next(proofs)
+        )
+
+        with pytest.raises(ValueError, match="Mission Control"):
+            kb.create_task(
+                conn,
+                title="root" if replay else "new root",
+                assignee="planner",
+                idempotency_key="root-key" if replay else "new-root-key",
+                orchestration_policy=_policy(),
+            )
+
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+        assert kb.get_task(conn, existing) is not None
+        if not replay:
+            assert conn.execute(
+                "SELECT 1 FROM tasks WHERE idempotency_key='new-root-key'"
+            ).fetchone() is None
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(

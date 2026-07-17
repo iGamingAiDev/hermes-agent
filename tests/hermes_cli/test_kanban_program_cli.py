@@ -26,7 +26,17 @@ def _argv(extra=""):
     )
 
 
-def test_program_create_cli_emits_deterministic_safe_json_and_canonical_root(kanban_home):
+VALID_CGROUP = b"0::/system.slice/vigo-mc-command-0123456789abcdef01.service\n"
+
+
+@pytest.fixture
+def mission_control_cgroup(monkeypatch):
+    monkeypatch.setattr(kb, "_read_self_cgroup", lambda: VALID_CGROUP)
+
+
+def test_program_create_broker_emits_deterministic_safe_json_and_canonical_root(
+    kanban_home, mission_control_cgroup,
+):
     parser = kc.build_parser(__import__("argparse").ArgumentParser().add_subparsers())
     args = parser.parse_args(shlex.split(_argv()))
     assert kc.kanban_command(args) == 0
@@ -57,7 +67,9 @@ def test_program_create_cli_emits_deterministic_safe_json_and_canonical_root(kan
     "--assignee worker",
     "--project missing-project",
 ])
-def test_program_create_cli_invalid_input_leaves_no_root(kanban_home, extra):
+def test_program_create_cli_invalid_input_leaves_no_root(
+    kanban_home, mission_control_cgroup, extra,
+):
     parser = kc.build_parser(__import__("argparse").ArgumentParser().add_subparsers())
     args = parser.parse_args(shlex.split(_argv(extra)))
     assert kc.kanban_command(args) == 2
@@ -70,6 +82,84 @@ def test_program_create_is_rejected_by_slash_without_creating_row(kanban_home):
     assert "trusted" in output.lower() and "direct" in output.lower()
     with kb.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_program_create_is_rejected_by_direct_argv_without_creating_row(
+    kanban_home, capsys, monkeypatch,
+):
+    """A terminal-capable model must not turn direct argv into root authority."""
+    parser = kc.build_parser(__import__("argparse").ArgumentParser().add_subparsers())
+    args = parser.parse_args(shlex.split(_argv()))
+    monkeypatch.setattr(kb, "_read_self_cgroup", lambda: b"0::/user.slice/test.service\n")
+    monkeypatch.setattr(kb, "init_db", lambda *a, **k: pytest.fail("DB initialized"))
+    assert kc.kanban_command(args) == 2
+    assert "mission control" in capsys.readouterr().err.lower()
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_program_create_direct_argv_rejects_forged_namespace_marker(
+    kanban_home, capsys, monkeypatch,
+):
+    parser = kc.build_parser(__import__("argparse").ArgumentParser().add_subparsers())
+    args = parser.parse_args(shlex.split(_argv()))
+    args.trusted = True
+    args.broker = "mission-control"
+    args._trusted_program_create = True
+    monkeypatch.setattr(kb, "_read_self_cgroup", lambda: b"0::/user.slice/test.service\n")
+    assert kc.kanban_command(args) == 2
+    assert "mission control" in capsys.readouterr().err.lower()
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("cgroup", [
+    b"0::/system.slice/vigo-mc-command-0123456789abcdef0.service\n",
+    b"0::/system.slice/hermes-mc-command-0123456789abcdef01.service\n",
+    b"0::/system.slice/vigo-mc-command-0123456789ABCDEf01.service\n",
+    b"0::/system.slice/vigo-mc-command-0123456789abcdef01.service.extra\n",
+    b"0::/system.slice/../system.slice/vigo-mc-command-0123456789abcdef01.service\n",
+    VALID_CGROUP + b"1:name=systemd:/system.slice/other.service\n",
+    b"not:a:cgroup:line\n",
+    b"",
+    b"x" * (kb._CGROUP_READ_LIMIT + 1),
+])
+def test_program_create_rejects_non_exact_cgroup(kanban_home, monkeypatch, cgroup):
+    parser = kc.build_parser(__import__("argparse").ArgumentParser().add_subparsers())
+    args = parser.parse_args(shlex.split(_argv()))
+    monkeypatch.setattr(kb, "_read_self_cgroup", lambda: cgroup)
+    assert kc.kanban_command(args) == 2
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("error", [PermissionError("denied"), FileNotFoundError()])
+def test_program_create_rejects_unreadable_or_missing_cgroup(
+    kanban_home, monkeypatch, error,
+):
+    parser = kc.build_parser(__import__("argparse").ArgumentParser().add_subparsers())
+    args = parser.parse_args(shlex.split(_argv()))
+
+    def unreadable():
+        raise error
+
+    monkeypatch.setattr(kb, "_read_self_cgroup", unreadable)
+    assert kc.kanban_command(args) == 2
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_program_create_accepts_exact_v1_systemd_cgroup(
+    kanban_home, monkeypatch,
+):
+    parser = kc.build_parser(__import__("argparse").ArgumentParser().add_subparsers())
+    args = parser.parse_args(shlex.split(_argv()))
+    monkeypatch.setattr(
+        kb, "_read_self_cgroup",
+        lambda: b"7:cpu,cpuacct:/ordinary\n1:name=systemd:/system.slice/"
+        b"vigo-mc-command-fedcba9876543210ab.service\n",
+    )
+    assert kc.kanban_command(args) == 0
 
 
 def test_interactive_kanban_dispatch_uses_fail_closed_slash_path(kanban_home, capsys):
