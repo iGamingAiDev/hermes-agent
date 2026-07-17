@@ -1,5 +1,9 @@
 import json
+import os
 import shlex
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -28,10 +32,44 @@ def _argv(extra=""):
 
 VALID_CGROUP = b"0::/system.slice/vigo-mc-command-0123456789abcdef01.service\n"
 
+_WORKTREE = Path(__file__).resolve().parents[2]
+
+
+def _run_real_cli(home, *args):
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(_WORKTREE)
+    return subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", *args],
+        cwd=_WORKTREE,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
 
 @pytest.fixture
 def mission_control_cgroup(monkeypatch):
     monkeypatch.setattr(kb, "_read_self_cgroup", lambda: VALID_CGROUP)
+
+
+def test_real_cli_propagates_program_create_denial_without_creating_db(tmp_path):
+    home = tmp_path / ".hermes"
+    result = _run_real_cli(home, *shlex.split(_argv()))
+
+    assert result.returncode == 2
+    assert "mission control" in result.stderr.lower()
+    assert not (home / "kanban.db").exists()
+
+
+def test_real_cli_propagates_success_for_harmless_kanban_command(tmp_path):
+    home = tmp_path / ".hermes"
+    result = _run_real_cli(home, "boards", "list", "--json")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)[0]["slug"] == "default"
+    assert not (home / "kanban.db").exists()
 
 
 def test_program_create_broker_emits_deterministic_safe_json_and_canonical_root(

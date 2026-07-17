@@ -13187,7 +13187,7 @@ def main():
     from hermes_cli.kanban import build_parser as _build_kanban_parser
 
     kanban_parser = _build_kanban_parser(subparsers)
-    kanban_parser.set_defaults(func=cmd_kanban)
+    kanban_parser.set_defaults(func=cmd_kanban, _propagate_exit_code=True)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
@@ -14873,10 +14873,12 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        if getattr(args, "_propagate_exit_code", False):
+            return result
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
