@@ -1246,6 +1246,58 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
         assert task.consecutive_failures == 0
 
 
+def test_spawn_failure_circuit_breaker_sets_transient_block_kind(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="spawn failure", assignee="worker", max_retries=1
+        )
+        assert kb.claim_task(conn, task_id) is not None
+
+        assert kb._record_spawn_failure(
+            conn, task_id, "launcher unavailable", failure_limit=1
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "transient"
+
+
+def test_runtime_timeout_circuit_breaker_sets_transient_block_kind(
+    kanban_home, monkeypatch
+):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="timeout",
+            assignee="worker",
+            max_retries=1,
+            max_runtime_seconds=1,
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, task_id, claimer=f"{host}:timeout")
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid = 999999 WHERE id = ?", (task_id,)
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = 999999, started_at = ? WHERE id = ?",
+            (now - 1, claimed.current_run_id),
+        )
+
+        assert kb.enforce_max_runtime(
+            conn, signal_fn=lambda _pid, _sig: None
+        ) == [task_id]
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "transient"
+
+
 def test_recompute_ready_recovers_below_limit(kanban_home):
     """recompute_ready auto-recovers blocked tasks that haven't hit the
     failure limit yet — the counter is preserved across recovery."""

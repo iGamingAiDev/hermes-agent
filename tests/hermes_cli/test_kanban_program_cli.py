@@ -3,6 +3,7 @@ import os
 import shlex
 import subprocess
 import sys
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -207,3 +208,176 @@ def test_interactive_kanban_dispatch_uses_fail_closed_slash_path(kanban_home, ca
     assert "trusted direct" in capsys.readouterr().out.lower()
     with kb.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def _parse_program(argv):
+    parser = kc.build_parser(__import__("argparse").ArgumentParser().add_subparsers())
+    return parser.parse_args(shlex.split(argv))
+
+
+def _create_program_root():
+    policy = kb.OrchestrationPolicy(
+        allowed_assignees=("planner", "worker"),
+        orchestrator_assignees=("planner",),
+        max_depth=2,
+        max_tasks=8,
+        max_runtime_seconds=60,
+        max_concurrency=2,
+        max_wall_clock_seconds=300,
+        goal_max_turns=5,
+    )
+    with kb.connect() as conn:
+        return kb.create_task(
+            conn,
+            title="program",
+            assignee="planner",
+            orchestration_policy=policy,
+            created_by="mission-control",
+            idempotency_key="cli-root",
+        )
+
+
+def test_program_extend_deadline_cli_emits_one_json_document(
+    kanban_home, mission_control_cgroup, capsys, monkeypatch
+):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    root_id = _create_program_root()
+    args = _parse_program(
+        f"program extend-deadline {root_id} --new-deadline {now + 600} "
+        "--actor operator --idempotency-key extend-cli --json"
+    )
+    assert kc.kanban_command(args) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out)["effective_deadline"] == now + 600
+    assert captured.out.count("\n") == 1
+
+
+def test_program_change_prepare_apply_cli_reads_strict_json_stdin(
+    kanban_home, mission_control_cgroup, capsys, monkeypatch
+):
+    now = 1_700_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    root_id = _create_program_root()
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(json.dumps({"operation": "extend_deadline", "new_deadline": now + 600})),
+    )
+    prepare_args = _parse_program(
+        f"program change prepare {root_id} --actor operator "
+        "--idempotency-key prepare-cli --json"
+    )
+    assert kc.kanban_command(prepare_args) == 0
+    prepared = json.loads(capsys.readouterr().out)
+
+    apply_args = _parse_program(
+        f"program change apply {root_id} {prepared['request_id']} --actor approver "
+        "--idempotency-key apply-cli --json"
+    )
+    assert kc.kanban_command(apply_args) == 0
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["status"] == "applied"
+    assert applied["effective_deadline"] == now + 600
+
+
+def test_program_change_prepare_cli_rejects_non_object_json(
+    kanban_home, mission_control_cgroup, capsys, monkeypatch
+):
+    root_id = _create_program_root()
+    monkeypatch.setattr(sys, "stdin", StringIO("[]"))
+    args = _parse_program(
+        f"program change prepare {root_id} --actor operator "
+        "--idempotency-key invalid-cli --json"
+    )
+    assert kc.kanban_command(args) != 0
+    assert capsys.readouterr().out == ""
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM program_change_requests").fetchone()[0] == 0
+
+
+def test_real_cli_rejects_untrusted_program_change_without_creating_db(tmp_path):
+    home = tmp_path / ".hermes"
+    result = _run_real_cli(
+        home,
+        "program",
+        "change",
+        "prepare",
+        "root-id",
+        "--actor",
+        "operator",
+        "--idempotency-key",
+        "prepare-cli",
+        "--json",
+    )
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert not (home / "kanban.db").exists()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"operation":"bogus","operation":"archive"}',
+        '{"operation":"archive","meta":{"x":1,"x":2}}',
+        '{"operation":"archive","reason":NaN}',
+        '{"operation":"archive","reason":Infinity}',
+        '{"operation":"archive","reason":-Infinity}',
+        '{"operation":"archive"} {"operation":"archive"}',
+    ],
+)
+def test_program_change_prepare_cli_rejects_non_strict_json_without_row(
+    kanban_home, mission_control_cgroup, capsys, monkeypatch, raw
+):
+    root_id = _create_program_root()
+    monkeypatch.setattr(sys, "stdin", StringIO(raw))
+    args = _parse_program(
+        f"program change prepare {root_id} --actor operator "
+        "--idempotency-key strict-invalid --json"
+    )
+    assert kc.kanban_command(args) != 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM program_change_requests").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("extra_bytes", [0, 1])
+def test_strict_request_parser_enforces_exact_utf8_byte_limit(extra_bytes):
+    prefix = '{"operation":"archive","reason":"'
+    suffix = '"}'
+    padding = "x" * (16 * 1024 + extra_bytes - len((prefix + suffix).encode("utf-8")))
+    raw = prefix + padding + suffix
+    assert len(raw.encode("utf-8")) == 16 * 1024 + extra_bytes
+    if extra_bytes:
+        with pytest.raises(ValueError, match="exceeds 16384 bytes"):
+            kc._read_strict_json_object(StringIO(raw))
+    else:
+        assert kc._read_strict_json_object(StringIO(raw))["operation"] == "archive"
+
+
+def test_strict_request_parser_rejects_invalid_utf8_bytes():
+    class BinaryStdin:
+        def __init__(self):
+            from io import BytesIO
+
+            self.buffer = BytesIO(b'{"operation":"archive","reason":"\xff"}')
+
+    with pytest.raises(ValueError, match="UTF-8"):
+        kc._read_strict_json_object(BinaryStdin())
+
+
+def test_program_change_rejection_precedes_database_initialization(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(kb, "_read_self_cgroup", lambda: b"0::/user.slice/test.service\n")
+    monkeypatch.setattr(kb, "init_db", lambda *a, **k: pytest.fail("DB initialized"))
+    monkeypatch.setattr(sys, "stdin", StringIO('{"operation":"archive"}'))
+    args = _parse_program(
+        "program change prepare root-id --actor operator "
+        "--idempotency-key denied --json"
+    )
+    assert kc.kanban_command(args) == 2
+    assert capsys.readouterr().out == ""

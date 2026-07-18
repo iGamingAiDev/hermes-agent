@@ -43,6 +43,58 @@ _STATUS_ICONS = {
     "archived": "—",
 }
 
+_PROGRAM_CHANGE_JSON_LIMIT = 16 * 1024
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonstandard_json_constant(value: str) -> Any:
+    raise ValueError(f"non-standard JSON constant is not allowed: {value}")
+
+
+def _read_strict_json_object(stream: Any = None) -> dict[str, Any]:
+    """Read one bounded UTF-8 JSON object, rejecting ambiguous JSON forms."""
+    stream = sys.stdin if stream is None else stream
+    binary = getattr(stream, "buffer", None)
+    try:
+        if binary is not None:
+            raw_bytes = binary.read(_PROGRAM_CHANGE_JSON_LIMIT + 1)
+            if not isinstance(raw_bytes, bytes):
+                raise ValueError("stdin did not provide bytes")
+            if len(raw_bytes) > _PROGRAM_CHANGE_JSON_LIMIT:
+                raise ValueError("change request JSON exceeds 16384 bytes")
+            try:
+                raw = raw_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise ValueError("change request JSON must be valid UTF-8") from exc
+        else:
+            raw = stream.read(_PROGRAM_CHANGE_JSON_LIMIT + 1)
+            if not isinstance(raw, str):
+                raise ValueError("change request JSON must be text")
+            try:
+                raw_bytes = raw.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as exc:
+                raise ValueError("change request JSON must be valid UTF-8") from exc
+            if len(raw_bytes) > _PROGRAM_CHANGE_JSON_LIMIT:
+                raise ValueError("change request JSON exceeds 16384 bytes")
+        value = json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError("stdin must contain exactly one valid JSON document") from exc
+    if not isinstance(value, dict):
+        raise ValueError("change request JSON must be an object")
+    return value
+
 
 def _fmt_ts(ts: Optional[int]) -> str:
     if not ts:
@@ -388,6 +440,36 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_program_create.add_argument("--project", default=None)
     p_program_create.add_argument("--idempotency-key", default=None)
     p_program_create.add_argument("--json", action="store_true")
+
+    def _program_mutation_args(parser, *, request_id=False):
+        parser.add_argument("root_id")
+        if request_id:
+            parser.add_argument("request_id")
+        parser.add_argument("--actor", required=True)
+        parser.add_argument("--idempotency-key", required=True)
+        parser.add_argument("--json", action="store_true")
+
+    p_program_extend = program_sub.add_parser(
+        "extend-deadline", help="Monotonically extend a program deadline"
+    )
+    _program_mutation_args(p_program_extend)
+    p_program_extend.add_argument("--new-deadline", type=int, required=True)
+
+    p_program_archive = program_sub.add_parser(
+        "archive", help="Archive a terminal program"
+    )
+    _program_mutation_args(p_program_archive)
+
+    p_program_change = program_sub.add_parser(
+        "change", help="Prepare or apply a durable program change request"
+    )
+    change_sub = p_program_change.add_subparsers(dest="change_action", required=True)
+    p_change_prepare = change_sub.add_parser(
+        "prepare", help="Prepare strict change JSON read from stdin"
+    )
+    _program_mutation_args(p_change_prepare)
+    p_change_apply = change_sub.add_parser("apply", help="Apply a prepared change")
+    _program_mutation_args(p_change_apply, request_id=True)
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -910,7 +992,7 @@ def kanban_command(args: argparse.Namespace) -> int:
     # Reject before board resolution or DB initialization can read, create, or
     # mutate any persistent state.
     if action == "program" and not kb.is_mission_control_command_cgroup():
-        return _reject_program_create()
+        return _reject_program_command()
 
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
@@ -1395,18 +1477,75 @@ def _cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
-def _reject_program_create() -> int:
+def _reject_program_command() -> int:
     print(
-        "kanban program create: restricted to the trusted Mission Control broker",
+        "kanban program: restricted to the trusted Mission Control broker",
         file=sys.stderr,
     )
     return 2
 
 
 def _cmd_program_create(args: argparse.Namespace) -> int:
+    """Dispatch trusted program creation and lifecycle mutations."""
+    if not kb.is_mission_control_command_cgroup():
+        return _reject_program_command()
+    action = args.program_action
+    if action == "create":
+        return _cmd_program_create_root(args)
+    try:
+        change = None
+        if action == "change" and args.change_action == "prepare":
+            change = _read_strict_json_object()
+        with kb.connect_closing() as conn:
+            if action == "extend-deadline":
+                result = kb.extend_program_deadline(
+                    conn,
+                    args.root_id,
+                    new_deadline=args.new_deadline,
+                    actor=args.actor,
+                    idempotency_key=args.idempotency_key,
+                )
+            elif action == "archive":
+                result = kb.archive_program(
+                    conn,
+                    args.root_id,
+                    actor=args.actor,
+                    idempotency_key=args.idempotency_key,
+                )
+            elif action == "change" and args.change_action == "prepare":
+                if change is None:  # Defensive narrowing; stdin was parsed above.
+                    raise ValueError("missing change request")
+                result = kb.prepare_program_change_request(
+                    conn,
+                    args.root_id,
+                    change=change,
+                    actor=args.actor,
+                    idempotency_key=args.idempotency_key,
+                )
+            elif action == "change" and args.change_action == "apply":
+                result = kb.apply_program_change_request(
+                    conn,
+                    args.root_id,
+                    request_id=args.request_id,
+                    actor=args.actor,
+                    idempotency_key=args.idempotency_key,
+                )
+            else:  # pragma: no cover - argparse makes this unreachable
+                raise ValueError("unknown program action")
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"kanban program {action}: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    else:
+        print(f"Program {action} completed for {result['root_id']}")
+    return 0
+
+
+def _cmd_program_create_root(args: argparse.Namespace) -> int:
     """Create a program root only inside Mission Control's command unit."""
     if not kb.is_mission_control_command_cgroup():
-        return _reject_program_create()
+        return _reject_program_command()
     try:
         policy = kb.OrchestrationPolicy(
             allowed_assignees=tuple(args.allowed_assignee),
@@ -1426,6 +1565,8 @@ def _cmd_program_create(args: argparse.Namespace) -> int:
                 orchestration_policy=policy, created_by=_profile_author(),
             )
             task = kb.get_task(conn, task_id)
+            if task is None or task.orchestration_policy is None:
+                raise ValueError("created program root could not be verified")
     except ValueError as exc:
         print(f"kanban program create: {exc}", file=sys.stderr)
         return 2
@@ -2873,13 +3014,14 @@ def run_slash(rest: str) -> str:
     # reject before argparse dispatch so no future handler refactor can expose
     # this mutation surface outside trusted direct OS argv.
     command_tokens = [token for token in tokens if not token.startswith("--board=")]
-    if command_tokens[:2] == ["program", "create"] or (
-        len(command_tokens) >= 4
+    is_program_command = command_tokens[:1] == ["program"] or (
+        len(command_tokens) >= 3
         and command_tokens[0] == "--board"
-        and command_tokens[2:4] == ["program", "create"]
-    ):
+        and command_tokens[2] == "program"
+    )
+    if is_program_command:
         return (
-            "⚠ /kanban program create is restricted to the trusted direct "
+            "⚠ /kanban program is restricted to the trusted direct "
             "OS argv CLI"
         )
 
