@@ -219,9 +219,6 @@ def test_v3_children_require_active_orchestrator_and_exact_requested_role(tmp_pa
                 assignee="reviewer-a",
                 role="writer",
             )
-        assert kb.complete_task(
-            conn, root_id, result="delegated", expected_run_id=root_claim.current_run_id
-        )
         writer_claim = kb.claim_task(conn, writer_id)
         assert writer_claim is not None
         with pytest.raises(ValueError, match="orchestrator"):
@@ -306,9 +303,6 @@ def test_v3_per_role_concurrency_and_integrator_serialization(tmp_path):
         integrator_b = _child(
             conn, authority, title="ib", assignee="integrator-a", role="integrator"
         )
-        assert kb.complete_task(
-            conn, root_id, result="delegated", expected_run_id=root_claim.current_run_id
-        )
         assert kb.claim_task(conn, writer_a) is not None
         assert kb.claim_task(conn, writer_b) is None
         assert kb.claim_task(conn, integrator_a) is not None
@@ -329,9 +323,6 @@ def test_v3_child_policy_downgrade_cannot_bypass_integrator_serialization(tmp_pa
         )
         second = _child(
             conn, authority, title="i2", assignee="integrator-a", role="integrator"
-        )
-        assert kb.complete_task(
-            conn, root_id, result="delegated", expected_run_id=root_claim.current_run_id
         )
         assert kb.claim_task(conn, first) is not None
         legacy = kb.OrchestrationPolicy(
@@ -505,7 +496,6 @@ def test_task_and_run_role_rewrites_fail_closed_against_immutable_evidence(tmp_p
         writer = _child(conn, authority, title="writer", assignee="writer-a", role="writer")
         first = _child(conn, authority, title="i1", assignee="integrator-a", role="integrator")
         second = _child(conn, authority, title="i2", assignee="integrator-a", role="integrator")
-        assert kb.complete_task(conn, root_id, result="delegated", expected_run_id=root_claim.current_run_id)
         conn.execute(
             "UPDATE tasks SET assignee='integrator-a', program_role='integrator' WHERE id=?",
             (writer,),
@@ -618,6 +608,17 @@ def test_exact_p2a_program_schema_backfills_existing_applied_generation(tmp_path
     conn.close()
 
     raw = sqlite3.connect(db_path)
+    # Reconstruct the genuine P2A predecessor: remove all later delivery and
+    # Director successor objects rather than accepting an impossible hybrid.
+    raw.execute("DROP TRIGGER trg_task_events_completed_no_update")
+    raw.execute("DROP TRIGGER trg_task_events_completed_no_delete")
+    for table in (
+        "program_delivery_evidence",
+        "program_delivery_operations",
+        "program_deliveries",
+        "program_director_authority",
+    ):
+        raw.execute(f"DROP TABLE {table}")
     for trigger in (
         "trg_program_task_role_evidence_no_update",
         "trg_program_task_role_evidence_no_delete",

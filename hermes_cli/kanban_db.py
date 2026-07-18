@@ -1733,6 +1733,63 @@ CREATE TABLE IF NOT EXISTS program_decision_events (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS program_deliveries (
+    delivery_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, integration_task_id TEXT,
+    project_id TEXT NOT NULL, project_binding_digest TEXT NOT NULL,
+    repository_identity_digest TEXT NOT NULL,
+    delivery_mode TEXT NOT NULL CHECK (delivery_mode IN ('pr','live_nonprod')),
+    source_control_adapter TEXT NOT NULL CHECK (source_control_adapter = 'github-v1'),
+    ci_adapter TEXT NOT NULL CHECK (ci_adapter = 'github-actions-v1'),
+    nonproduction_adapter TEXT NOT NULL CHECK (nonproduction_adapter IN ('none','mission-control-local-v1')),
+    policy_digest TEXT NOT NULL,
+    authority_evidence_generation INTEGER NOT NULL CHECK (authority_evidence_generation >= 0),
+    state TEXT NOT NULL CHECK (state IN ('plan','writers','integration','review','pr','ci','nonprod','e2e','candidate','failed','invalidate')),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    candidate_generation INTEGER NOT NULL DEFAULT 0 CHECK (candidate_generation >= 0),
+    base_sha TEXT, candidate_sha TEXT, candidate_digest TEXT,
+    required_check_policy_digest TEXT, active_operation_id TEXT,
+    reconcile_phase TEXT CHECK (reconcile_phase IS NULL OR reconcile_phase IN ('pr','nonprod','e2e')),
+    reconcile_code TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    UNIQUE(root_id, project_binding_digest)
+);
+CREATE TABLE IF NOT EXISTS program_director_authority (
+    root_id TEXT PRIMARY KEY,
+    director_authority_digest TEXT NOT NULL
+        CHECK (length(director_authority_digest)=64
+               AND director_authority_digest NOT GLOB '*[^0-9a-f]*'),
+    policy_digest TEXT NOT NULL,
+    authority_evidence_generation INTEGER NOT NULL
+        CHECK (authority_evidence_generation >= 0),
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS program_delivery_operations (
+    operation_id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL,
+    candidate_generation INTEGER NOT NULL CHECK (candidate_generation >= 1),
+    phase TEXT NOT NULL CHECK (phase IN ('pr','nonprod','e2e')),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1), adapter_id TEXT NOT NULL,
+    method TEXT NOT NULL, request_json TEXT NOT NULL, request_digest TEXT NOT NULL,
+    approval_binding_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('prepared','claimed','dispatch_started','confirmed','clean_failed','ambiguous')),
+    expected_delivery_version INTEGER NOT NULL CHECK (expected_delivery_version >= 1),
+    claimed_by_task_id TEXT, claimed_by_run_id INTEGER, claimed_by_profile TEXT,
+    claimed_by_role TEXT CHECK (claimed_by_role IS NULL OR claimed_by_role IN ('orchestrator','writer','integrator','reviewer','security_reviewer','qa_verifier')),
+    outcome_code TEXT, result_json TEXT, result_digest TEXT,
+    prepared_at INTEGER NOT NULL, claimed_at INTEGER, dispatch_started_at INTEGER, settled_at INTEGER,
+    UNIQUE(delivery_id, candidate_generation, phase, attempt_no)
+);
+CREATE TABLE IF NOT EXISTS program_delivery_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_id TEXT NOT NULL,
+    resulting_version INTEGER NOT NULL CHECK (resulting_version >= 1),
+    candidate_generation INTEGER NOT NULL CHECK (candidate_generation >= 0), operation_id TEXT,
+    event_type TEXT NOT NULL CHECK (event_type IN ('delivery_prepared','state_transitioned','candidate_bound','review_recorded','operation_prepared','operation_claimed','remote_dispatch_started','remote_observed','operation_settled','ci_observed','reconcile_observed','delivery_invalidated')),
+    actor_task_id TEXT, actor_run_id INTEGER, actor_profile TEXT,
+    actor_role TEXT CHECK (actor_role IS NULL OR actor_role IN ('orchestrator','writer','integrator','reviewer','security_reviewer','qa_verifier')),
+    policy_digest TEXT NOT NULL,
+    authority_evidence_generation INTEGER NOT NULL CHECK (authority_evidence_generation >= 0),
+    request_digest TEXT, evidence_digest TEXT NOT NULL, payload_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL, UNIQUE(delivery_id, resulting_version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1745,6 +1802,18 @@ CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_program_lifecycle_events_root
     ON program_lifecycle_events(root_id, id);
+CREATE INDEX IF NOT EXISTS idx_program_deliveries_root ON program_deliveries(root_id, state);
+CREATE INDEX IF NOT EXISTS idx_program_delivery_operations_delivery
+    ON program_delivery_operations(delivery_id, candidate_generation, phase, status);
+CREATE INDEX IF NOT EXISTS idx_program_delivery_evidence_delivery
+    ON program_delivery_evidence(delivery_id, id);
+
+CREATE TRIGGER IF NOT EXISTS trg_task_events_completed_no_update
+BEFORE UPDATE ON task_events WHEN OLD.kind='completed' OR NEW.kind='completed'
+BEGIN SELECT RAISE(ABORT, 'completed task event evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_task_events_completed_no_delete
+BEFORE DELETE ON task_events WHEN OLD.kind='completed'
+BEGIN SELECT RAISE(ABORT, 'completed task event evidence is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_program_lifecycle_events_no_update
 BEFORE UPDATE ON program_lifecycle_events
@@ -1782,6 +1851,35 @@ BEGIN SELECT RAISE(ABORT, 'program decision audit is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_program_decision_events_no_delete
 BEFORE DELETE ON program_decision_events
 BEGIN SELECT RAISE(ABORT, 'program decision audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_deliveries_no_delete BEFORE DELETE ON program_deliveries
+BEGIN SELECT RAISE(ABORT, 'program delivery is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_deliveries_identity_no_update
+BEFORE UPDATE OF delivery_id,root_id,project_id,project_binding_digest,repository_identity_digest,delivery_mode,source_control_adapter,ci_adapter,nonproduction_adapter,policy_digest,authority_evidence_generation,created_at ON program_deliveries
+BEGIN SELECT RAISE(ABORT, 'program delivery identity is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_deliveries_candidate_immutable
+BEFORE UPDATE OF integration_task_id,base_sha,candidate_sha,candidate_digest,required_check_policy_digest,candidate_generation ON program_deliveries WHEN OLD.candidate_generation > 0
+BEGIN SELECT RAISE(ABORT, 'program delivery candidate is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_deliveries_state_guard BEFORE UPDATE OF state ON program_deliveries
+WHEN NOT ((OLD.state='plan' AND NEW.state='writers') OR (OLD.state='writers' AND NEW.state='integration') OR (OLD.state='integration' AND NEW.state='review') OR (OLD.state='review' AND NEW.state='pr') OR (OLD.state='pr' AND NEW.state='ci') OR (OLD.state='ci' AND NEW.state IN ('ci','nonprod','failed')) OR (OLD.state='nonprod' AND NEW.state IN ('e2e','failed')) OR (OLD.state='e2e' AND NEW.state IN ('candidate','failed')) OR (OLD.state IN ('plan','writers','integration','review','pr','ci','nonprod','e2e') AND NEW.state IN ('failed','invalidate')))
+BEGIN SELECT RAISE(ABORT, 'program delivery state transition rejected'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_delivery_operations_no_delete BEFORE DELETE ON program_delivery_operations
+BEGIN SELECT RAISE(ABORT, 'program delivery operation is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_delivery_operations_identity_no_update
+BEFORE UPDATE OF operation_id,delivery_id,candidate_generation,phase,attempt_no,adapter_id,method,request_json,request_digest,approval_binding_digest,expected_delivery_version,prepared_at ON program_delivery_operations
+BEGIN SELECT RAISE(ABORT, 'program delivery operation identity is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_delivery_operations_status_guard BEFORE UPDATE OF status ON program_delivery_operations
+WHEN NOT ((OLD.status='prepared' AND NEW.status IN ('claimed','clean_failed','ambiguous')) OR (OLD.status='claimed' AND NEW.status IN ('dispatch_started','clean_failed','ambiguous')) OR (OLD.status='dispatch_started' AND NEW.status IN ('confirmed','clean_failed','ambiguous')))
+BEGIN SELECT RAISE(ABORT, 'program delivery operation status transition rejected'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_delivery_evidence_no_update BEFORE UPDATE ON program_delivery_evidence
+BEGIN SELECT RAISE(ABORT, 'program delivery evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_delivery_evidence_no_delete BEFORE DELETE ON program_delivery_evidence
+BEGIN SELECT RAISE(ABORT, 'program delivery evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_director_authority_no_update
+BEFORE UPDATE ON program_director_authority
+BEGIN SELECT RAISE(ABORT, 'program director authority is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_director_authority_no_delete
+BEFORE DELETE ON program_director_authority
+BEGIN SELECT RAISE(ABORT, 'program director authority is append-only'); END;
 """
 
 
@@ -1801,10 +1899,19 @@ _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS = frozenset(
         "program_decision_public_options",
         "program_decision_affected_nodes",
         "program_decision_events",
+        "program_deliveries",
+        "program_delivery_operations",
+        "program_delivery_evidence",
+        "program_director_authority",
+        "idx_program_deliveries_root",
+        "idx_program_delivery_operations_delivery",
+        "idx_program_delivery_evidence_delivery",
     }
 )
 _PROGRAM_SCHEMA_TRIGGER_OBJECTS = frozenset(
     {
+        "trg_task_events_completed_no_update",
+        "trg_task_events_completed_no_delete",
         "trg_program_lifecycle_events_no_update",
         "trg_program_lifecycle_events_no_delete",
         "trg_program_change_request_events_no_update",
@@ -1817,13 +1924,49 @@ _PROGRAM_SCHEMA_TRIGGER_OBJECTS = frozenset(
         "trg_program_operator_hints_no_delete",
         "trg_program_decision_events_no_update",
         "trg_program_decision_events_no_delete",
+        "trg_program_deliveries_no_delete",
+        "trg_program_deliveries_identity_no_update",
+        "trg_program_deliveries_candidate_immutable",
+        "trg_program_deliveries_state_guard",
+        "trg_program_delivery_operations_no_delete",
+        "trg_program_delivery_operations_identity_no_update",
+        "trg_program_delivery_operations_status_guard",
+        "trg_program_delivery_evidence_no_update",
+        "trg_program_delivery_evidence_no_delete",
+        "trg_program_director_authority_no_update",
+        "trg_program_director_authority_no_delete",
     }
 )
 _PROGRAM_SCHEMA_OBJECTS = (
     _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS | _PROGRAM_SCHEMA_TRIGGER_OBJECTS
 )
+_PROGRAM_SCHEMA_COMPLETION_EVIDENCE_OBJECTS = frozenset(
+    {
+        "trg_task_events_completed_no_update",
+        "trg_task_events_completed_no_delete",
+    }
+)
+_PROGRAM_SCHEMA_PRE_COMPLETION_OBJECTS = (
+    _PROGRAM_SCHEMA_OBJECTS - _PROGRAM_SCHEMA_COMPLETION_EVIDENCE_OBJECTS
+)
+_PROGRAM_SCHEMA_DIRECTOR_OBJECTS = frozenset(
+    name for name in _PROGRAM_SCHEMA_PRE_COMPLETION_OBJECTS
+    if name.startswith("program_director_") or name.startswith("trg_program_director_")
+)
+_PROGRAM_SCHEMA_P2E_TABLE_OBJECTS = (
+    _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS - {"program_director_authority"}
+)
+_PROGRAM_SCHEMA_P2E_OBJECTS = (
+    _PROGRAM_SCHEMA_PRE_COMPLETION_OBJECTS - _PROGRAM_SCHEMA_DIRECTOR_OBJECTS
+)
+_PROGRAM_SCHEMA_DELIVERY_OBJECTS = frozenset(
+    name for name in _PROGRAM_SCHEMA_P2E_OBJECTS
+    if name.startswith("program_deliver") or name.startswith("idx_program_deliver")
+    or name.startswith("trg_program_deliver")
+)
+_PROGRAM_SCHEMA_P2D_OBJECTS = _PROGRAM_SCHEMA_P2E_OBJECTS - _PROGRAM_SCHEMA_DELIVERY_OBJECTS
 _PROGRAM_SCHEMA_P2A_OBJECTS = frozenset(
-    name for name in _PROGRAM_SCHEMA_OBJECTS
+    name for name in _PROGRAM_SCHEMA_P2D_OBJECTS
     if name not in {
         "program_task_role_evidence", "program_run_admission_evidence",
         "trg_program_task_role_evidence_no_update",
@@ -1869,11 +2012,12 @@ def _canonical_program_schema_signatures() -> dict[str, tuple[str, str, str]]:
         canonical = sqlite3.connect(":memory:")
         try:
             canonical.executescript(SCHEMA_SQL)
+            signature_names = _PROGRAM_SCHEMA_OBJECTS | {"tasks", "task_runs"}
             rows = canonical.execute(
                 "SELECT type, name, sql FROM sqlite_master WHERE name IN ("
-                + ",".join("?" for _ in _PROGRAM_SCHEMA_OBJECTS)
+                + ",".join("?" for _ in signature_names)
                 + ")",
-                tuple(sorted(_PROGRAM_SCHEMA_OBJECTS)),
+                tuple(sorted(signature_names)),
             ).fetchall()
         finally:
             canonical.close()
@@ -1906,6 +2050,10 @@ def _preflight_program_schema(path: Path) -> bool:
                     + "OR name GLOB 'trg_program_*'",
                     tuple(sorted(_PROGRAM_SCHEMA_OBJECTS)),
                 ).fetchall()
+                base_rows = probe.execute(
+                    "SELECT type,name,sql FROM sqlite_master "
+                    "WHERE name IN ('tasks','task_runs')"
+                ).fetchall()
             except sqlite3.DatabaseError:
                 # This preflight classifies only readable lifecycle schemas.
                 # Preserve the existing corruption/quarantine path as the
@@ -1916,6 +2064,9 @@ def _preflight_program_schema(path: Path) -> bool:
     actual = {
         row[1]: (row[0], row[1], _normalize_schema_sql(row[2])) for row in rows
     }
+    base_actual = {
+        row[1]: (row[0], row[1], _normalize_schema_sql(row[2])) for row in base_rows
+    }
     names = frozenset(actual)
     if names not in {
         frozenset(),
@@ -1924,26 +2075,37 @@ def _preflight_program_schema(path: Path) -> bool:
         _PROGRAM_SCHEMA_PHASE1_OBJECTS | _PROGRAM_SCHEMA_PHASE1_TRIGGERS,
         _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS,
         _PROGRAM_SCHEMA_OBJECTS,
+        _PROGRAM_SCHEMA_PRE_COMPLETION_OBJECTS,
+        _PROGRAM_SCHEMA_P2E_TABLE_OBJECTS,
+        _PROGRAM_SCHEMA_P2E_OBJECTS,
         _PROGRAM_SCHEMA_P2A_OBJECTS,
+        _PROGRAM_SCHEMA_P2D_OBJECTS,
     }:
         raise ValueError("unsupported program lifecycle schema")
     canonical = _canonical_program_schema_signatures()
+    if names == _PROGRAM_SCHEMA_P2D_OBJECTS and (
+        set(base_actual) != {"tasks", "task_runs"}
+        or any(base_actual[name] != canonical[name] for name in base_actual)
+    ):
+        raise ValueError("unsupported program lifecycle schema")
     prior_lifecycle_sql = _normalize_schema_sql(
         "CREATE TABLE program_lifecycle (root_id TEXT PRIMARY KEY, "
         "root_fingerprint TEXT NOT NULL, initial_deadline INTEGER NOT NULL, "
         "effective_deadline INTEGER NOT NULL, archived_at INTEGER, "
         "archive_actor TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
     )
-    current_matches = all(actual[name] == canonical[name] for name in names)
+    signature_matches = all(actual[name] == canonical[name] for name in names)
     exact_p2a = (
         names == _PROGRAM_SCHEMA_P2A_OBJECTS
         and actual["program_lifecycle"]
         == ("table", "program_lifecycle", prior_lifecycle_sql)
         and all(actual[name] == canonical[name] for name in names if name != "program_lifecycle")
     )
-    if not current_matches and not exact_p2a:
+    if not signature_matches and not exact_p2a:
         raise ValueError("unsupported program lifecycle schema")
-    return current_matches
+    return signature_matches and names in {
+        _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS, _PROGRAM_SCHEMA_OBJECTS
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2920,6 +3082,12 @@ _REBUILD_SPECS = {
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE TRIGGER trg_task_events_completed_no_update "
+            "BEFORE UPDATE ON task_events WHEN OLD.kind='completed' OR NEW.kind='completed' "
+            "BEGIN SELECT RAISE(ABORT, 'completed task event evidence is immutable'); END",
+            "CREATE TRIGGER trg_task_events_completed_no_delete "
+            "BEFORE DELETE ON task_events WHEN OLD.kind='completed' "
+            "BEGIN SELECT RAISE(ABORT, 'completed task event evidence is immutable'); END",
         ),
     ),
     "task_comments": (
@@ -3574,7 +3742,14 @@ def create_task(
                     orchestration_depth = authority.orchestration_depth + 1
                     tenant = authority.tenant
                     project_id = authority.project_id
-                    parents = requested_parents or (authority.id,)
+                    if policy.version == 3:
+                        # Creator lineage is already sealed independently in
+                        # orchestration_parent_id and immutable role evidence.
+                        # Do not turn that authority edge into an implicit DAG
+                        # dependency: v3 dependencies must be explicit.
+                        parents = requested_parents
+                    else:
+                        parents = requested_parents or (authority.id,)
                     max_runtime_seconds = policy.max_runtime_seconds
                     goal_max_turns = policy.goal_max_turns
                 elif policy is not None:
@@ -5181,6 +5356,921 @@ def select_program_decision(
     }
 
 
+_DELIVERY_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_DELIVERY_ID_RE = re.compile(r"delivery_[0-9a-f]{64}\Z")
+_DELIVERY_OPERATION_ID_RE = re.compile(r"op_[0-9a-f]{64}\Z")
+_DELIVERY_SHA_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_DIRECTOR_AUTHORITY_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def bind_program_director_authority(
+    conn: sqlite3.Connection, *, root_id: str, policy_digest: str,
+    authority_evidence_generation: int, director_authority_digest: str,
+) -> dict[str, Any]:
+    """Bind the non-spawnable Director control authority once to a v3 root."""
+    if not is_mission_control_command_cgroup():
+        raise ValueError("program director authority requires trusted Mission Control")
+    if not isinstance(director_authority_digest, str) or _DIRECTOR_AUTHORITY_RE.fullmatch(
+        director_authority_digest
+    ) is None:
+        raise ValueError("director_authority_digest must be 64 lowercase hex characters")
+    if not isinstance(policy_digest, str) or _DELIVERY_DIGEST_RE.fullmatch(policy_digest) is None:
+        raise ValueError("program director policy digest is invalid")
+    if type(authority_evidence_generation) is not int or authority_evidence_generation < 0:
+        raise ValueError("program director authority generation is invalid")
+    root_id = _delivery_identity(root_id, "root_id")
+    with write_txn(conn):
+        root = _program_root_row(conn, root_id)
+        policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
+        lifecycle = conn.execute(
+            "SELECT evidence_generation,archived_at FROM program_lifecycle WHERE root_id=?",
+            (root_id,),
+        ).fetchone()
+        if (
+            policy.version != 3 or policy.policy_digest != policy_digest
+            or lifecycle is None or lifecycle["archived_at"] is not None
+            or lifecycle["evidence_generation"] != authority_evidence_generation
+        ):
+            raise ValueError("program director authority policy or generation drift")
+        existing = conn.execute(
+            "SELECT * FROM program_director_authority WHERE root_id=?", (root_id,)
+        ).fetchone()
+        expected = (director_authority_digest, policy_digest, authority_evidence_generation)
+        if existing is not None:
+            actual = (
+                existing["director_authority_digest"], existing["policy_digest"],
+                existing["authority_evidence_generation"],
+            )
+            if actual != expected:
+                raise ValueError("program director authority binding mismatch or drift")
+            return {"root_id": root_id, "director_authority_digest": director_authority_digest,
+                    "deduplicated": True}
+        conn.execute(
+            "INSERT INTO program_director_authority "
+            "(root_id,director_authority_digest,policy_digest,authority_evidence_generation,created_at) "
+            "VALUES (?,?,?,?,?)",
+            (root_id, director_authority_digest, policy_digest,
+             authority_evidence_generation, int(time.time())),
+        )
+    return {"root_id": root_id, "director_authority_digest": director_authority_digest,
+            "deduplicated": False}
+
+
+def _assert_director_authority(value: Any) -> str:
+    if not isinstance(value, str) or _DIRECTOR_AUTHORITY_RE.fullmatch(value) is None:
+        raise ValueError("director_authority_digest must be 64 lowercase hex characters")
+    return value
+
+
+def _delivery_digest(value: Any, field: str) -> str:
+    if not isinstance(value, str) or _DELIVERY_DIGEST_RE.fullmatch(value) is None:
+        raise ValueError(f"{field} must be an exact sha256 digest")
+    return value
+
+
+def _delivery_identity(value: Any, field: str, pattern: re.Pattern[str] | None = None) -> str:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 200:
+        raise ValueError(f"{field} is invalid")
+    if pattern is not None and pattern.fullmatch(value) is None:
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def _delivery_json(value: Any, field: str, *, maximum: int = 4096) -> tuple[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    text, digest = _sha256_json(value)
+    if len(text.encode("utf-8")) > maximum:
+        raise ValueError(f"{field} exceeds limit")
+    forbidden = {"repository", "repo", "path", "body", "output", "url"}
+
+    def key_tokens(key: Any) -> set[str]:
+        text = str(key)
+        # Normalize camelCase/PascalCase before splitting snake, kebab, dotted,
+        # and other separators.  Security decisions are made on semantic
+        # tokens, not on one spelling of a key.
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+        text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", text)
+        return {token.casefold() for token in re.split(r"[^A-Za-z0-9]+", text) if token}
+
+    def contains_forbidden(item: Any) -> bool:
+        if isinstance(item, dict):
+            return any(
+                bool(key_tokens(key) & forbidden) or contains_forbidden(child)
+                for key, child in item.items()
+            )
+        if isinstance(item, list):
+            return any(contains_forbidden(child) for child in item)
+        return False
+
+    if contains_forbidden(value):
+        raise ValueError(f"{field} contains forbidden raw material")
+    return text, digest
+
+
+def _delivery_row(conn: sqlite3.Connection, delivery_id: str) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM program_deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()
+    if row is None:
+        raise ValueError("unknown program delivery")
+    return row
+
+
+def _delivery_operation_snapshot(operation: Any) -> dict[str, Any]:
+    """Bounded evidence projection for all mutable operation state.
+
+    ``result_json`` is intentionally represented only by its already verified
+    digest.  Delivery evidence must never become a second store for raw remote
+    adapter responses.
+    """
+    return {
+        "operation_id": operation["operation_id"],
+        "delivery_id": operation["delivery_id"],
+        "candidate_generation": operation["candidate_generation"],
+        "phase": operation["phase"],
+        "attempt_no": operation["attempt_no"],
+        "adapter_id": operation["adapter_id"],
+        "method": operation["method"],
+        "request_digest": operation["request_digest"],
+        "approval_binding_digest": operation["approval_binding_digest"],
+        "expected_delivery_version": operation["expected_delivery_version"],
+        "status": operation["status"],
+        "claimed_by_task_id": operation["claimed_by_task_id"],
+        "claimed_by_run_id": operation["claimed_by_run_id"],
+        "claimed_by_profile": operation["claimed_by_profile"],
+        "claimed_by_role": operation["claimed_by_role"],
+        "outcome_code": operation["outcome_code"],
+        "result_digest": operation["result_digest"],
+        "result_json_digest": operation["result_digest"] if operation["result_json"] is not None else None,
+        "prepared_at": operation["prepared_at"],
+        "claimed_at": operation["claimed_at"],
+        "dispatch_started_at": operation["dispatch_started_at"],
+        "settled_at": operation["settled_at"],
+    }
+
+
+def _delivery_operation_snapshot_keys() -> frozenset[str]:
+    return frozenset({
+        "operation_id", "delivery_id", "candidate_generation", "phase", "attempt_no",
+        "adapter_id", "method", "request_digest", "approval_binding_digest",
+        "expected_delivery_version", "status", "claimed_by_task_id", "claimed_by_run_id",
+        "claimed_by_profile", "claimed_by_role", "outcome_code", "result_digest",
+        "result_json_digest", "prepared_at", "claimed_at", "dispatch_started_at", "settled_at",
+    })
+
+
+def _assert_delivery_operation_snapshot_transition(
+    event_type: str,
+    snapshot: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> None:
+    expected_status = {
+        "operation_prepared": "prepared",
+        "operation_claimed": "claimed",
+        "remote_dispatch_started": "dispatch_started",
+        "operation_settled": {"confirmed", "clean_failed", "ambiguous"},
+        "reconcile_observed": "ambiguous",
+    }.get(event_type)
+    status = snapshot.get("status")
+    status_matches = (
+        status in expected_status if isinstance(expected_status, set)
+        else status == expected_status
+    )
+    immutable = (
+        "operation_id", "delivery_id", "candidate_generation", "phase", "attempt_no",
+        "adapter_id", "method", "request_digest", "approval_binding_digest",
+        "expected_delivery_version", "prepared_at",
+    )
+    claimed = (
+        "claimed_by_task_id", "claimed_by_run_id", "claimed_by_profile", "claimed_by_role",
+    )
+    valid = status_matches and frozenset(snapshot) == _delivery_operation_snapshot_keys()
+    if previous is not None:
+        transitions = {
+            "prepared": {"claimed"},
+            "claimed": {"dispatch_started"},
+            "dispatch_started": {"confirmed", "clean_failed", "ambiguous"},
+        }
+        previous_status = previous.get("status")
+        if event_type == "reconcile_observed":
+            valid = valid and previous_status == "ambiguous" and status == "ambiguous"
+        else:
+            valid = (
+                valid
+                and isinstance(previous_status, str)
+                and status in transitions.get(previous_status, set())
+            )
+        valid = valid and all(snapshot.get(key) == previous.get(key) for key in immutable)
+        if previous.get("status") != "prepared":
+            valid = valid and all(snapshot.get(key) == previous.get(key) for key in claimed)
+    if status == "prepared":
+        valid = valid and all(snapshot.get(key) is None for key in (
+            *claimed, "claimed_at", "dispatch_started_at", "settled_at",
+            "outcome_code", "result_digest", "result_json_digest",
+        ))
+    elif status == "claimed":
+        valid = valid and snapshot.get("claimed_by_role") == "integrator"
+        valid = valid and all(snapshot.get(key) is not None for key in (*claimed, "claimed_at"))
+        valid = valid and all(snapshot.get(key) is None for key in (
+            "dispatch_started_at", "settled_at", "outcome_code", "result_digest",
+            "result_json_digest",
+        ))
+    elif status == "dispatch_started":
+        valid = valid and snapshot.get("dispatch_started_at") is not None
+        valid = valid and all(snapshot.get(key) is None for key in (
+            "settled_at", "outcome_code", "result_digest", "result_json_digest",
+        ))
+    else:
+        valid = valid and all(snapshot.get(key) is not None for key in (
+            "settled_at", "outcome_code", "result_digest", "result_json_digest",
+        ))
+        valid = valid and snapshot.get("result_json_digest") == snapshot.get("result_digest")
+    if not valid:
+        raise ValueError("program delivery operation history integrity check failed")
+
+
+def _assert_program_delivery_history(conn: sqlite3.Connection, delivery: sqlite3.Row) -> None:
+    rows = conn.execute(
+        "SELECT * FROM program_delivery_evidence WHERE delivery_id=? ORDER BY resulting_version LIMIT 1002",
+        (delivery["delivery_id"],),
+    ).fetchall()
+    if len(rows) != delivery["version"] or len(rows) > 1000:
+        raise ValueError("program delivery history integrity check failed")
+    operation_snapshots: dict[str, dict[str, Any]] = {}
+    for expected, row in enumerate(rows, 1):
+        try:
+            payload = json.loads(row["payload_json"])
+            payload_json, evidence_digest = _sha256_json(payload)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("program delivery history integrity check failed") from exc
+        expected_payload_keys = {
+            "delivery_id", "resulting_version", "state", "candidate_generation",
+            "reconcile_phase", "reconcile_code", "event_type", "idempotency_key",
+            "request_fingerprint",
+        }
+        if row["operation_id"] is not None:
+            expected_payload_keys.add("operation")
+        if row["event_type"] == "reconcile_observed":
+            expected_payload_keys.add("reconciliation")
+        if (
+            row["resulting_version"] != expected
+            or payload_json != row["payload_json"]
+            or evidence_digest != row["evidence_digest"]
+            or not isinstance(payload, dict)
+            or payload.get("delivery_id") != delivery["delivery_id"]
+            or payload.get("resulting_version") != expected
+            or payload.get("candidate_generation") != row["candidate_generation"]
+            or frozenset(payload) != frozenset(expected_payload_keys)
+            or len(payload_json.encode("utf-8")) > 4096
+        ):
+            raise ValueError("program delivery history integrity check failed")
+        if row["operation_id"] is not None:
+            snapshot = payload.get("operation")
+            if (
+                not isinstance(snapshot, dict)
+                or snapshot.get("operation_id") != row["operation_id"]
+                or snapshot.get("delivery_id") != delivery["delivery_id"]
+            ):
+                raise ValueError("program delivery operation history integrity check failed")
+            _assert_delivery_operation_snapshot_transition(
+                row["event_type"], snapshot, operation_snapshots.get(row["operation_id"])
+            )
+            operation_snapshots[row["operation_id"]] = snapshot
+        if row["event_type"] == "reconcile_observed":
+            reconciliation = payload.get("reconciliation")
+            if (
+                not isinstance(reconciliation, dict)
+                or frozenset(reconciliation)
+                != frozenset({
+                    "operation_id", "observed_outcome", "observed_code",
+                    "observation_digest",
+                })
+                or reconciliation.get("operation_id") != row["operation_id"]
+                or reconciliation.get("observed_outcome") not in {"confirmed", "clean_failed"}
+                or not _DELIVERY_DIGEST_RE.fullmatch(
+                    str(reconciliation.get("observation_digest", ""))
+                )
+            ):
+                raise ValueError("program delivery reconciliation history integrity check failed")
+    last = json.loads(rows[-1]["payload_json"])
+    if (
+        last.get("state") != delivery["state"]
+        or last.get("candidate_generation") != delivery["candidate_generation"]
+        or last.get("reconcile_phase") != delivery["reconcile_phase"]
+        or last.get("reconcile_code") != delivery["reconcile_code"]
+        or rows[-1]["policy_digest"] != delivery["policy_digest"]
+        or rows[-1]["authority_evidence_generation"] != delivery["authority_evidence_generation"]
+    ):
+        raise ValueError("program delivery history integrity check failed")
+    operations = conn.execute(
+        "SELECT * FROM program_delivery_operations WHERE delivery_id=? ORDER BY operation_id LIMIT 1002",
+        (delivery["delivery_id"],),
+    ).fetchall()
+    if len(operations) > 1000 or len(operations) != len(operation_snapshots):
+        raise ValueError("program delivery operation history integrity check failed")
+    for operation in operations:
+        snapshot = operation_snapshots.get(operation["operation_id"])
+        if snapshot != _delivery_operation_snapshot(operation):
+            raise ValueError("program delivery operation history integrity check failed")
+        result_json = operation["result_json"]
+        if result_json is not None:
+            try:
+                result = json.loads(result_json)
+                canonical_json, canonical_digest = _sha256_json(result)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("program delivery operation history integrity check failed") from exc
+            if canonical_json != result_json or canonical_digest != operation["result_digest"]:
+                raise ValueError("program delivery operation history integrity check failed")
+
+
+def _delivery_authority(
+    conn: sqlite3.Connection, request: dict[str, Any], delivery: sqlite3.Row | None = None
+) -> tuple[sqlite3.Row, sqlite3.Row]:
+    root_id = delivery["root_id"] if delivery is not None else request.get("root_id")
+    root_id = _delivery_identity(root_id, "root_id")
+    raw_root = conn.execute(
+        "SELECT orchestration_policy,orchestration_root_id,orchestration_depth FROM tasks WHERE id=?",
+        (root_id,),
+    ).fetchone()
+    if raw_root is None or raw_root["orchestration_policy"] is None or raw_root["orchestration_root_id"] != root_id or raw_root["orchestration_depth"] != 0:
+        raise ValueError("role_policy_required")
+    root = _program_root_row(conn, root_id)
+    policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
+    if policy.version != 3:
+        raise ValueError("role_policy_required")
+    digest = _delivery_digest(request.get("policy_digest"), "policy_digest")
+    generation = request.get("authority_evidence_generation")
+    if type(generation) is not int or generation < 0:
+        raise ValueError("authority evidence generation is invalid")
+    lifecycle = conn.execute("SELECT * FROM program_lifecycle WHERE root_id=?", (root_id,)).fetchone()
+    if lifecycle is None or lifecycle["archived_at"] is not None:
+        raise ValueError("program lifecycle authority is unavailable")
+    if lifecycle["evidence_generation"] != generation:
+        raise ValueError("stale authority evidence generation")
+    if digest != policy.policy_digest:
+        raise ValueError("program policy digest mismatch")
+    if delivery is not None and (
+        delivery["policy_digest"] != digest
+        or delivery["authority_evidence_generation"] != generation
+    ):
+        raise ValueError("program delivery authority binding mismatch")
+    director_digest = _assert_director_authority(request.get("director_authority_digest"))
+    director = conn.execute(
+        "SELECT * FROM program_director_authority WHERE root_id=?", (root_id,)
+    ).fetchone()
+    if director is None or (
+        director["director_authority_digest"] != director_digest
+        or director["policy_digest"] != digest
+        or director["authority_evidence_generation"] != generation
+    ):
+        raise ValueError("program director authority binding mismatch or drift")
+    task_id = _delivery_identity(request.get("actor_task_id"), "actor_task_id")
+    run_id = request.get("actor_run_id")
+    profile = _delivery_identity(request.get("actor_profile"), "actor_profile")
+    role = request.get("actor_role")
+    if type(run_id) is not int or run_id < 1 or role not in _PROGRAM_ROLE_SET:
+        raise ValueError("actor authority is invalid")
+    authority = conn.execute(
+        "SELECT t.*,r.profile AS run_profile,r.program_role AS run_role,r.orchestration_policy_digest AS run_digest,r.evidence_generation AS run_generation,r.status AS run_status,r.ended_at AS run_ended,te.profile AS evidence_profile,te.program_role AS evidence_role,te.policy_digest AS evidence_digest,te.root_id AS evidence_root,te.evidence_generation AS evidence_generation,re.profile AS admission_profile,re.program_role AS admission_role,re.policy_digest AS admission_digest,re.root_id AS admission_root,re.evidence_generation AS admission_generation "
+        "FROM tasks t JOIN task_runs r ON r.id=? AND r.task_id=t.id "
+        "JOIN program_task_role_evidence te ON te.task_id=t.id AND te.assignment_version=(SELECT MAX(x.assignment_version) FROM program_task_role_evidence x WHERE x.task_id=t.id) "
+        "JOIN program_run_admission_evidence re ON re.run_id=r.id WHERE t.id=?",
+        (run_id, task_id),
+    ).fetchone()
+    if authority is None or any((
+        authority["status"] != "running", authority["current_run_id"] != run_id,
+        authority["run_status"] != "running", authority["run_ended"] is not None,
+        authority["assignee"] != profile, authority["run_profile"] != profile,
+        authority["evidence_profile"] != profile, authority["admission_profile"] != profile,
+        authority["program_role"] != role, authority["run_role"] != role,
+        authority["evidence_role"] != role, authority["admission_role"] != role,
+        authority["orchestration_root_id"] != root_id, authority["evidence_root"] != root_id,
+        authority["admission_root"] != root_id, authority["orchestration_policy_digest"] != digest,
+        authority["run_digest"] != digest, authority["evidence_digest"] != digest,
+        authority["admission_digest"] != digest, authority["evidence_generation"] != generation,
+        authority["run_generation"] != generation, authority["admission_generation"] != generation,
+        policy.role_for_profile(profile) != role,
+    )):
+        raise ValueError("program role evidence integrity check failed")
+    return root, authority
+
+
+def _delivery_result(
+    delivery: Any, *, evidence_digest: str, operation: sqlite3.Row | None = None,
+    deduplicated: bool = False,
+) -> dict[str, Any]:
+    return {
+        "ok": True, "delivery_id": delivery["delivery_id"], "state": delivery["state"],
+        "version": delivery["version"], "candidate_generation": delivery["candidate_generation"],
+        "operation_id": operation["operation_id"] if operation is not None else None,
+        "operation_status": operation["status"] if operation is not None else None,
+        "deduplicated": deduplicated, "evidence_digest": evidence_digest,
+    }
+
+
+def _append_delivery_evidence(
+    conn: sqlite3.Connection, delivery: sqlite3.Row, request: dict[str, Any],
+    event_type: str, *, operation_id: str | None = None, request_digest: str | None = None,
+) -> str:
+    payload = {
+        "delivery_id": delivery["delivery_id"], "resulting_version": delivery["version"],
+        "state": delivery["state"], "candidate_generation": delivery["candidate_generation"],
+        "reconcile_phase": delivery["reconcile_phase"],
+        "reconcile_code": delivery["reconcile_code"],
+        "event_type": event_type, "idempotency_key": request["idempotency_key"],
+        "request_fingerprint": _sha256_json(request)[1],
+    }
+    if operation_id is not None:
+        operation = conn.execute(
+            "SELECT * FROM program_delivery_operations WHERE operation_id=? AND delivery_id=?",
+            (operation_id, delivery["delivery_id"]),
+        ).fetchone()
+        if operation is None:
+            raise ValueError("program delivery operation history integrity check failed")
+        payload["operation"] = _delivery_operation_snapshot(operation)
+    if event_type == "reconcile_observed":
+        payload["reconciliation"] = {
+            "operation_id": operation_id,
+            "observed_outcome": request["observed_outcome"],
+            "observed_code": request["observed_code"],
+            "observation_digest": request["observation_digest"],
+        }
+    payload_json, evidence_digest = _delivery_json(payload, "evidence")
+    conn.execute(
+        "INSERT INTO program_delivery_evidence (delivery_id,resulting_version,candidate_generation,operation_id,event_type,actor_task_id,actor_run_id,actor_profile,actor_role,policy_digest,authority_evidence_generation,request_digest,evidence_digest,payload_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (delivery["delivery_id"], delivery["version"], delivery["candidate_generation"], operation_id,
+         event_type, request["actor_task_id"], request["actor_run_id"], request["actor_profile"],
+         request["actor_role"], request["policy_digest"], request["authority_evidence_generation"],
+         request_digest, evidence_digest, payload_json, int(time.time())),
+    )
+    return evidence_digest
+
+
+def _delivery_replay(
+    conn: sqlite3.Connection, delivery: sqlite3.Row, request: dict[str, Any], event_type: str
+) -> tuple[dict[str, Any], str] | None:
+    fingerprint = _sha256_json(request)[1]
+    for row in conn.execute(
+        "SELECT * FROM program_delivery_evidence WHERE delivery_id=? AND event_type=?",
+        (delivery["delivery_id"], event_type),
+    ):
+        payload = json.loads(row["payload_json"])
+        if payload.get("idempotency_key") == request.get("idempotency_key"):
+            if payload.get("request_fingerprint") != fingerprint:
+                raise ValueError("idempotency key request does not match")
+            historic = dict(delivery)
+            historic["version"] = row["resulting_version"]
+            historic["state"] = payload["state"]
+            historic["candidate_generation"] = row["candidate_generation"]
+            return historic, row["evidence_digest"]
+    return None
+
+
+def prepare_program_delivery(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any]:
+    if not is_mission_control_command_cgroup():
+        raise ValueError("program delivery requires trusted Mission Control")
+    if not isinstance(request, dict):
+        raise ValueError("delivery request must be an object")
+    with write_txn(conn):
+        root, _ = _delivery_authority(conn, request)
+        delivery_id = _delivery_identity(request.get("delivery_id"), "delivery_id", _DELIVERY_ID_RE)
+        existing = conn.execute("SELECT * FROM program_deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()
+        if existing is not None:
+            _assert_program_delivery_history(conn, existing)
+            replay = _delivery_replay(conn, existing, request, "delivery_prepared")
+            if replay is None:
+                raise ValueError("delivery identity request does not match")
+            row, evidence_digest = replay
+            return _delivery_result(row, evidence_digest=evidence_digest, deduplicated=True)
+        mode = request.get("delivery_mode")
+        adapters = (request.get("source_control_adapter"), request.get("ci_adapter"), request.get("nonproduction_adapter"))
+        if mode not in {"pr", "live_nonprod"} or adapters[0] != "github-v1" or adapters[1] != "github-actions-v1" or adapters[2] not in {"none", "mission-control-local-v1"}:
+            raise ValueError("unsupported delivery adapter binding")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO program_deliveries (delivery_id,root_id,project_id,project_binding_digest,repository_identity_digest,delivery_mode,source_control_adapter,ci_adapter,nonproduction_adapter,policy_digest,authority_evidence_generation,state,version,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'plan',1,?,?)",
+            (delivery_id, root["id"], _delivery_identity(request.get("project_id"), "project_id"),
+             _delivery_digest(request.get("project_binding_digest"), "project_binding_digest"),
+             _delivery_digest(request.get("repository_identity_digest"), "repository_identity_digest"),
+             mode, *adapters, request["policy_digest"], request["authority_evidence_generation"], now, now),
+        )
+        delivery = _delivery_row(conn, delivery_id)
+        evidence_digest = _append_delivery_evidence(conn, delivery, request, "delivery_prepared")
+    return _delivery_result(delivery, evidence_digest=evidence_digest)
+
+
+def transition_program_delivery(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any]:
+    delivery_id = _delivery_identity(request.get("delivery_id"), "delivery_id", _DELIVERY_ID_RE)
+    with write_txn(conn):
+        delivery = _delivery_row(conn, delivery_id)
+        _assert_program_delivery_history(conn, delivery)
+        _delivery_authority(conn, request, delivery)
+        replay = _delivery_replay(conn, delivery, request, "candidate_bound" if request.get("to_state") == "review" else "state_transitioned")
+        if replay is not None:
+            row, evidence_digest = replay
+            return _delivery_result(row, evidence_digest=evidence_digest, deduplicated=True)
+        source, target, expected = request.get("from_state"), request.get("to_state"), request.get("expected_version")
+        if not isinstance(source, str) or not isinstance(target, str) or type(expected) is not int:
+            raise ValueError("delivery transition request is invalid")
+        required_role = {
+            ("plan", "writers"): "orchestrator",
+            ("writers", "integration"): "orchestrator",
+            ("integration", "review"): "integrator",
+            ("pr", "ci"): "integrator",
+            ("ci", "nonprod"): "qa_verifier",
+            ("nonprod", "e2e"): "qa_verifier",
+            ("e2e", "candidate"): "qa_verifier",
+        }.get((source, target))
+        if required_role is None or request.get("actor_role") != required_role:
+            raise ValueError("illegal delivery role transition")
+        if source == "writers" and target == "integration":
+            completed_writer = conn.execute(
+                "SELECT 1 FROM tasks t "
+                "JOIN task_events v ON v.task_id=t.id AND v.kind='completed' "
+                "JOIN task_runs r ON r.id=v.run_id AND r.task_id=t.id "
+                "JOIN program_run_admission_evidence a ON a.run_id=r.id AND a.task_id=t.id "
+                "JOIN program_task_role_evidence e ON e.task_id=t.id AND e.assignment_version="
+                "(SELECT MAX(x.assignment_version) FROM program_task_role_evidence x WHERE x.task_id=t.id) "
+                "WHERE t.orchestration_root_id=? AND t.program_role='writer' AND t.status='done' "
+                "AND r.status='done' AND r.ended_at IS NOT NULL AND a.program_role='writer' "
+                "AND e.program_role='writer' AND a.profile=t.assignee AND e.profile=t.assignee "
+                "AND a.policy_digest=? AND e.policy_digest=? AND a.evidence_generation=? "
+                "AND e.evidence_generation=? LIMIT 1",
+                (delivery["root_id"], delivery["policy_digest"], delivery["policy_digest"],
+                 delivery["authority_evidence_generation"], delivery["authority_evidence_generation"]),
+            ).fetchone()
+            if completed_writer is None:
+                raise ValueError("writer completed run evidence is required")
+        stage = {
+            ("pr", "ci"): ("CI_VERIFIED", "ci_observed"),
+            ("ci", "nonprod"): ("NONPROD_STARTED", "remote_observed"),
+            ("nonprod", "e2e"): ("E2E_PASSED", "remote_observed"),
+            ("e2e", "candidate"): ("CANDIDATE", "state_transitioned"),
+        }.get((source, target))
+        if stage is not None:
+            if request.get("evidence_code") != stage[0]:
+                raise ValueError("delivery stage evidence code mismatch")
+            _delivery_digest(request.get("stage_evidence_digest"), "stage_evidence_digest")
+            if required_role == "qa_verifier":
+                prior_profiles = {row[0] for row in conn.execute(
+                    "SELECT DISTINCT actor_profile FROM program_delivery_evidence "
+                    "WHERE delivery_id=? AND actor_role IN ('writer','integrator','reviewer')",
+                    (delivery_id,),
+                ) if row[0] is not None}
+                if request.get("actor_profile") in prior_profiles:
+                    raise ValueError("qa_verifier must be distinct from writer, integrator, and reviewer")
+        if delivery["state"] != source or delivery["version"] != expected:
+            raise ValueError("stale delivery version")
+        values: list[Any] = [target, expected + 1, int(time.time())]
+        set_sql = "state=?,version=?,updated_at=?"
+        event = stage[1] if stage is not None else "state_transitioned"
+        if target == "review":
+            integration_task_id = _delivery_identity(
+                request.get("integration_task_id"), "integration_task_id"
+            )
+            if integration_task_id != request.get("actor_task_id"):
+                raise ValueError("integrator candidate task binding mismatch")
+            writer_profiles = {row[0] for row in conn.execute(
+                "SELECT DISTINCT a.profile FROM tasks t JOIN program_run_admission_evidence a "
+                "ON a.task_id=t.id WHERE t.orchestration_root_id=? AND a.program_role='writer'",
+                (delivery["root_id"],),
+            )}
+            if request.get("actor_profile") in writer_profiles:
+                raise ValueError("integrator must be distinct from writers")
+            for field in ("base_sha", "candidate_sha"):
+                if not isinstance(request.get(field), str) or _DELIVERY_SHA_RE.fullmatch(request[field]) is None:
+                    raise ValueError(f"{field} is invalid")
+            set_sql += ",integration_task_id=?,base_sha=?,candidate_sha=?,candidate_digest=?,required_check_policy_digest=?,candidate_generation=1"
+            values.extend((_delivery_identity(request.get("integration_task_id"), "integration_task_id"),
+                           request["base_sha"], request["candidate_sha"],
+                           _delivery_digest(request.get("candidate_digest"), "candidate_digest"),
+                           _delivery_digest(request.get("required_check_policy_digest"), "required_check_policy_digest")))
+            event = "candidate_bound"
+        values.extend((delivery_id, source, expected))
+        updated = conn.execute(f"UPDATE program_deliveries SET {set_sql} WHERE delivery_id=? AND state=? AND version=?", values)
+        if updated.rowcount != 1:
+            raise ValueError("stale delivery version")
+        delivery = _delivery_row(conn, delivery_id)
+        evidence_digest = _append_delivery_evidence(conn, delivery, request, event)
+    return _delivery_result(delivery, evidence_digest=evidence_digest)
+
+
+def record_program_delivery_review(
+    conn: sqlite3.Connection, request: dict[str, Any]
+) -> dict[str, Any]:
+    delivery_id = _delivery_identity(request.get("delivery_id"), "delivery_id", _DELIVERY_ID_RE)
+    with write_txn(conn):
+        delivery = _delivery_row(conn, delivery_id)
+        _assert_program_delivery_history(conn, delivery)
+        _delivery_authority(conn, request, delivery)
+        replay = _delivery_replay(conn, delivery, request, "review_recorded")
+        if replay is not None:
+            row, evidence_digest = replay
+            return _delivery_result(row, evidence_digest=evidence_digest, deduplicated=True)
+        if (
+            delivery["state"] != "review"
+            or delivery["version"] != request.get("expected_version")
+            or request.get("actor_role") != "reviewer"
+            or request.get("approval_code") != "APPROVED"
+        ):
+            raise ValueError("review approval request is ineligible")
+        _delivery_digest(request.get("approval_digest"), "approval_digest")
+        prior = conn.execute(
+            "SELECT actor_profile,actor_run_id FROM program_delivery_evidence "
+            "WHERE delivery_id=? AND actor_role IN ('writer','integrator')",
+            (delivery_id,),
+        ).fetchall()
+        if any(
+            row["actor_profile"] == request.get("actor_profile")
+            or row["actor_run_id"] == request.get("actor_run_id")
+            for row in prior
+        ):
+            raise ValueError("reviewer profile and run must be distinct from writers and integrator")
+        now = int(time.time())
+        updated = conn.execute(
+            "UPDATE program_deliveries SET version=version+1,updated_at=? "
+            "WHERE delivery_id=? AND state='review' AND version=?",
+            (now, delivery_id, delivery["version"]),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("stale delivery version")
+        delivery = _delivery_row(conn, delivery_id)
+        evidence_digest = _append_delivery_evidence(
+            conn, delivery, request, "review_recorded",
+            request_digest=request["approval_digest"],
+        )
+    return _delivery_result(delivery, evidence_digest=evidence_digest)
+
+
+def prepare_program_delivery_operation(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any]:
+    delivery_id = _delivery_identity(request.get("delivery_id"), "delivery_id", _DELIVERY_ID_RE)
+    operation_id = _delivery_identity(request.get("operation_id"), "operation_id", _DELIVERY_OPERATION_ID_RE)
+    with write_txn(conn):
+        delivery = _delivery_row(conn, delivery_id); _assert_program_delivery_history(conn, delivery)
+        _delivery_authority(conn, request, delivery)
+        existing = conn.execute("SELECT * FROM program_delivery_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        replay = _delivery_replay(conn, delivery, request, "operation_prepared")
+        if replay is not None:
+            if existing is None:
+                raise ValueError("program delivery operation history integrity check failed")
+            row, evidence_digest = replay
+            return _delivery_result(row, evidence_digest=evidence_digest, operation=existing, deduplicated=True)
+        if delivery["reconcile_phase"] is not None:
+            raise ValueError("delivery operation requires explicit reconcile before a new attempt")
+        if existing is not None:
+            raise ValueError("operation request does not match")
+        review_approval = conn.execute(
+            "SELECT actor_profile,actor_run_id FROM program_delivery_evidence "
+            "WHERE delivery_id=? AND event_type='review_recorded'",
+            (delivery_id,),
+        ).fetchall()
+        if len(review_approval) != 1:
+            raise ValueError("review approval evidence is required before PR")
+        if delivery["state"] != "review" or delivery["candidate_generation"] < 1 or delivery["version"] != request.get("expected_version"):
+            raise ValueError("stale or ineligible delivery version")
+        if (
+            request.get("actor_task_id") != delivery["integration_task_id"]
+            or request.get("actor_profile") == review_approval[0]["actor_profile"]
+            or request.get("actor_run_id") == review_approval[0]["actor_run_id"]
+        ):
+            raise ValueError("integrator PR authority does not match candidate binding")
+        if request.get("actor_role") != "integrator" or request.get("phase") != "pr" or request.get("adapter_id") != "github-v1" or request.get("method") != "createPullRequest":
+            raise ValueError("unsupported delivery operation")
+        request_json, _ = _delivery_json(request.get("request"), "adapter request")
+        adapter_request = request["request"]
+        if adapter_request.get("candidate_sha") != delivery["candidate_sha"]:
+            raise ValueError("adapter candidate SHA does not match delivery")
+        for field in ("candidate_sha", "candidate_digest", "project_id", "project_binding_digest"):
+            if field not in adapter_request or adapter_request[field] != delivery[field]:
+                raise ValueError(f"adapter {field} does not match delivery")
+        attempt = request.get("attempt_no")
+        if type(attempt) is not int or attempt < 1:
+            raise ValueError("attempt_no is invalid")
+        approval_binding_digest = _delivery_digest(
+            request.get("approval_binding_digest"), "approval_binding_digest"
+        )
+        _, canonical_digest = _sha256_json({
+            "delivery_id": delivery_id,
+            "candidate_generation": delivery["candidate_generation"],
+            "candidate_sha": delivery["candidate_sha"],
+            "candidate_digest": delivery["candidate_digest"],
+            "project_id": delivery["project_id"],
+            "project_binding_digest": delivery["project_binding_digest"],
+            "phase": request["phase"],
+            "attempt_no": attempt,
+            "adapter_id": request["adapter_id"],
+            "method": request["method"],
+            "approval_binding_digest": approval_binding_digest,
+            "adapter_request": adapter_request,
+        })
+        request_digest = _delivery_digest(request.get("request_digest"), "request_digest")
+        if canonical_digest != request_digest:
+            raise ValueError("exact operation request digest does not match")
+        now = int(time.time())
+        conn.execute("INSERT INTO program_delivery_operations (operation_id,delivery_id,candidate_generation,phase,attempt_no,adapter_id,method,request_json,request_digest,approval_binding_digest,status,expected_delivery_version,prepared_at) VALUES (?,?,?,?,?,?,?,?,?,?,'prepared',?,?)",
+                     (operation_id, delivery_id, delivery["candidate_generation"], request["phase"], attempt,
+                      request["adapter_id"], request["method"], request_json, request_digest,
+                      approval_binding_digest, delivery["version"], now))
+        delivery_update = conn.execute("UPDATE program_deliveries SET version=version+1,active_operation_id=?,updated_at=? WHERE delivery_id=? AND version=?",
+                                       (operation_id, now, delivery_id, delivery["version"]))
+        if delivery_update.rowcount != 1:
+            raise ValueError("delivery CAS failed")
+        delivery = _delivery_row(conn, delivery_id); operation = conn.execute("SELECT * FROM program_delivery_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        evidence_digest = _append_delivery_evidence(conn, delivery, request, "operation_prepared", operation_id=operation_id, request_digest=request_digest)
+    return _delivery_result(delivery, evidence_digest=evidence_digest, operation=operation)
+
+
+def _assert_claimed_operation_actor(operation: sqlite3.Row, request: dict[str, Any]) -> None:
+    claimed = (
+        operation["claimed_by_task_id"], operation["claimed_by_run_id"],
+        operation["claimed_by_profile"], operation["claimed_by_role"],
+    )
+    actor = (
+        request.get("actor_task_id"), request.get("actor_run_id"),
+        request.get("actor_profile"), request.get("actor_role"),
+    )
+    if request.get("actor_role") != "integrator" or claimed != actor:
+        raise ValueError("operation requires exact claimed integrator identity")
+
+
+def _mutate_delivery_operation(conn: sqlite3.Connection, request: dict[str, Any], *, old: str, new: str, event: str) -> dict[str, Any]:
+    delivery_id = _delivery_identity(request.get("delivery_id"), "delivery_id", _DELIVERY_ID_RE)
+    operation_id = _delivery_identity(request.get("operation_id"), "operation_id", _DELIVERY_OPERATION_ID_RE)
+    with write_txn(conn):
+        delivery = _delivery_row(conn, delivery_id); _assert_program_delivery_history(conn, delivery)
+        _delivery_authority(conn, request, delivery)
+        operation = conn.execute("SELECT * FROM program_delivery_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        if operation is None or operation["delivery_id"] != delivery_id:
+            raise ValueError("unknown delivery operation")
+        if operation["request_digest"] != _delivery_digest(request.get("request_digest"), "request_digest"):
+            raise ValueError("operation request digest does not match")
+        if new == "dispatch_started":
+            _assert_claimed_operation_actor(operation, request)
+        replay = _delivery_replay(conn, delivery, request, event)
+        if replay is not None:
+            row, evidence_digest = replay
+            return _delivery_result(row, evidence_digest=evidence_digest, operation=operation, deduplicated=True)
+        if operation["status"] in {"confirmed", "clean_failed", "ambiguous"}:
+            raise ValueError("terminal operation requires reconcile")
+        if delivery["version"] != request.get("expected_version") or operation["status"] != old:
+            raise ValueError("stale operation state or delivery version")
+        if request.get("actor_role") != "integrator":
+            raise ValueError("operation requires integrator role")
+        now = int(time.time())
+        extras = ""
+        params: list[Any] = [new]
+        if new == "claimed":
+            extras = ",claimed_by_task_id=?,claimed_by_run_id=?,claimed_by_profile=?,claimed_by_role=?,claimed_at=?"
+            params.extend((request["actor_task_id"], request["actor_run_id"], request["actor_profile"], request["actor_role"], now))
+        elif new == "dispatch_started":
+            extras = ",dispatch_started_at=?"; params.append(now)
+        params.extend((operation_id, old))
+        updated = conn.execute(f"UPDATE program_delivery_operations SET status=?{extras} WHERE operation_id=? AND status=?", params)
+        if updated.rowcount != 1:
+            raise ValueError("stale operation state")
+        delivery_update = conn.execute("UPDATE program_deliveries SET version=version+1,updated_at=? WHERE delivery_id=? AND version=?", (now, delivery_id, delivery["version"]))
+        if delivery_update.rowcount != 1:
+            raise ValueError("delivery CAS failed")
+        delivery = _delivery_row(conn, delivery_id); operation = conn.execute("SELECT * FROM program_delivery_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        evidence_digest = _append_delivery_evidence(conn, delivery, request, event, operation_id=operation_id, request_digest=operation["request_digest"])
+    return _delivery_result(delivery, evidence_digest=evidence_digest, operation=operation)
+
+
+def claim_program_delivery_operation(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any]:
+    return _mutate_delivery_operation(conn, request, old="prepared", new="claimed", event="operation_claimed")
+
+
+def mark_program_delivery_dispatch_started(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any]:
+    return _mutate_delivery_operation(conn, request, old="claimed", new="dispatch_started", event="remote_dispatch_started")
+
+
+def settle_program_delivery_operation(conn: sqlite3.Connection, request: dict[str, Any]) -> dict[str, Any]:
+    delivery_id = _delivery_identity(request.get("delivery_id"), "delivery_id", _DELIVERY_ID_RE)
+    operation_id = _delivery_identity(request.get("operation_id"), "operation_id", _DELIVERY_OPERATION_ID_RE)
+    with write_txn(conn):
+        delivery = _delivery_row(conn, delivery_id); _assert_program_delivery_history(conn, delivery)
+        _delivery_authority(conn, request, delivery)
+        operation = conn.execute("SELECT * FROM program_delivery_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        if operation is None or operation["delivery_id"] != delivery_id or operation["request_digest"] != _delivery_digest(request.get("request_digest"), "request_digest"):
+            raise ValueError("operation request digest does not match")
+        _assert_claimed_operation_actor(operation, request)
+        replay = _delivery_replay(conn, delivery, request, "operation_settled")
+        if replay is not None:
+            row, evidence_digest = replay
+            return _delivery_result(row, evidence_digest=evidence_digest, operation=operation, deduplicated=True)
+        if operation["status"] != "dispatch_started" or delivery["version"] != request.get("expected_version"):
+            if operation["status"] == "ambiguous":
+                raise ValueError("ambiguous terminal operation requires reconcile")
+            raise ValueError("stale operation state or delivery version")
+        outcome = request.get("outcome")
+        if outcome not in {"confirmed", "clean_failed", "ambiguous"}:
+            raise ValueError("operation outcome is invalid")
+        result_json, canonical_digest = _delivery_json(request.get("result"), "operation result", maximum=2048)
+        result_digest = _delivery_digest(request.get("result_digest"), "result_digest")
+        if canonical_digest != result_digest:
+            raise ValueError("operation result digest does not match")
+        now = int(time.time())
+        operation_update = conn.execute("UPDATE program_delivery_operations SET status=?,outcome_code=?,result_json=?,result_digest=?,settled_at=? WHERE operation_id=? AND status='dispatch_started'",
+                                        (outcome, _delivery_identity(request.get("outcome_code"), "outcome_code"), result_json, result_digest, now, operation_id))
+        if operation_update.rowcount != 1:
+            raise ValueError("operation CAS failed")
+        if outcome == "confirmed":
+            delivery_update = conn.execute("UPDATE program_deliveries SET state='pr',version=version+1,updated_at=? WHERE delivery_id=? AND state='review' AND version=?", (now, delivery_id, delivery["version"]))
+        else:
+            reconcile_phase = operation["phase"] if outcome == "ambiguous" else None
+            reconcile_code = request["outcome_code"] if outcome == "ambiguous" else None
+            delivery_update = conn.execute("UPDATE program_deliveries SET version=version+1,reconcile_phase=?,reconcile_code=?,updated_at=? WHERE delivery_id=? AND version=?", (reconcile_phase, reconcile_code, now, delivery_id, delivery["version"]))
+        if delivery_update.rowcount != 1:
+            raise ValueError("delivery CAS failed")
+        delivery = _delivery_row(conn, delivery_id); operation = conn.execute("SELECT * FROM program_delivery_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        evidence_digest = _append_delivery_evidence(conn, delivery, request, "operation_settled", operation_id=operation_id, request_digest=operation["request_digest"])
+    return _delivery_result(delivery, evidence_digest=evidence_digest, operation=operation)
+
+
+def reconcile_program_delivery_operation(
+    conn: sqlite3.Connection, request: dict[str, Any]
+) -> dict[str, Any]:
+    expected_request_keys = {
+        "delivery_id", "expected_version", "actor_task_id", "actor_run_id",
+        "actor_profile", "actor_role", "policy_digest",
+        "authority_evidence_generation", "director_authority_digest", "operation_id",
+        "request_digest", "observed_outcome", "observed_code", "observation_digest",
+        "idempotency_key",
+    }
+    if not isinstance(request, dict) or frozenset(request) != frozenset(expected_request_keys):
+        raise ValueError("reconciliation request schema is invalid")
+    delivery_id = _delivery_identity(request.get("delivery_id"), "delivery_id", _DELIVERY_ID_RE)
+    operation_id = _delivery_identity(
+        request.get("operation_id"), "operation_id", _DELIVERY_OPERATION_ID_RE
+    )
+    request_digest = _delivery_digest(request.get("request_digest"), "request_digest")
+    observed_outcome = request.get("observed_outcome")
+    if observed_outcome not in {"confirmed", "clean_failed"}:
+        raise ValueError("reconciliation outcome is invalid")
+    _delivery_identity(request.get("observed_code"), "observed_code")
+    _delivery_digest(request.get("observation_digest"), "observation_digest")
+    with write_txn(conn):
+        delivery = _delivery_row(conn, delivery_id)
+        _assert_program_delivery_history(conn, delivery)
+        _delivery_authority(conn, request, delivery)
+        operation = conn.execute(
+            "SELECT * FROM program_delivery_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if (
+            operation is None
+            or operation["delivery_id"] != delivery_id
+            or operation["request_digest"] != request_digest
+        ):
+            raise ValueError("operation request digest does not match")
+        _assert_claimed_operation_actor(operation, request)
+        replay = _delivery_replay(conn, delivery, request, "reconcile_observed")
+        if replay is not None:
+            row, evidence_digest = replay
+            return _delivery_result(
+                row, evidence_digest=evidence_digest, operation=operation, deduplicated=True
+            )
+        if (
+            operation["status"] != "ambiguous"
+            or delivery["reconcile_phase"] != operation["phase"]
+            or delivery["reconcile_code"] != operation["outcome_code"]
+            or delivery["version"] != request.get("expected_version")
+        ):
+            raise ValueError("delivery operation is not awaiting exact reconciliation")
+        now = int(time.time())
+        if observed_outcome == "confirmed":
+            updated = conn.execute(
+                "UPDATE program_deliveries SET state=?,version=version+1,"
+                "reconcile_phase=NULL,reconcile_code=NULL,updated_at=? "
+                "WHERE delivery_id=? AND version=? AND reconcile_phase=? AND reconcile_code=?",
+                (
+                    operation["phase"], now, delivery_id, delivery["version"],
+                    operation["phase"], operation["outcome_code"],
+                ),
+            )
+        else:
+            updated = conn.execute(
+                "UPDATE program_deliveries SET version=version+1,"
+                "reconcile_phase=NULL,reconcile_code=NULL,updated_at=? "
+                "WHERE delivery_id=? AND version=? AND reconcile_phase=? AND reconcile_code=?",
+                (
+                    now, delivery_id, delivery["version"],
+                    operation["phase"], operation["outcome_code"],
+                ),
+            )
+        if updated.rowcount != 1:
+            raise ValueError("delivery reconciliation CAS failed")
+        delivery = _delivery_row(conn, delivery_id)
+        evidence_digest = _append_delivery_evidence(
+            conn,
+            delivery,
+            request,
+            "reconcile_observed",
+            operation_id=operation_id,
+            request_digest=request_digest,
+        )
+    return _delivery_result(delivery, evidence_digest=evidence_digest, operation=operation)
+
+
 def _canonical_program_change(change: Any) -> tuple[dict[str, Any], str, str]:
     if not isinstance(change, dict):
         raise ValueError("change request JSON must be an object")
@@ -6230,9 +7320,21 @@ def claim_review_task(
     gate on its original ``todo -> ready -> running`` transition.
 
     Creates a new run entry so the review agent's lifecycle is tracked
-    independently from the original worker run.
+    independently from the original worker run. Managed v3 rows deliberately
+    fail closed because this generic path preserves the original assignee/role.
     """
     now = int(time.time())
+    managed = conn.execute(
+        "SELECT root.orchestration_policy FROM tasks child JOIN tasks root "
+        "ON root.id=child.orchestration_root_id WHERE child.id=? AND child.program_role IS NOT NULL",
+        (task_id,),
+    ).fetchone()
+    if managed is not None:
+        try:
+            if OrchestrationPolicy.from_json(managed[0]).version == 3:
+                return None
+        except (TypeError, ValueError):
+            return None
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
@@ -6743,6 +7845,58 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _assert_managed_completion_authority(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: Optional[int]
+) -> None:
+    row = conn.execute(
+        "SELECT t.*,r.status AS run_status,r.ended_at AS run_ended,r.profile AS run_profile,"
+        "r.program_role AS run_role,r.orchestration_policy_digest AS run_digest,"
+        "r.evidence_generation AS run_generation,e.profile AS admission_profile,"
+        "e.program_role AS admission_role,e.policy_digest AS admission_digest,"
+        "e.root_id AS admission_root,e.evidence_generation AS admission_generation,"
+        "a.profile AS assignment_profile,a.program_role AS assignment_role,"
+        "a.policy_digest AS assignment_digest,a.root_id AS assignment_root,"
+        "a.evidence_generation AS assignment_generation,l.evidence_generation AS lifecycle_generation "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id "
+        "LEFT JOIN program_run_admission_evidence e ON e.run_id=r.id "
+        "LEFT JOIN program_task_role_evidence a ON a.task_id=t.id AND a.assignment_version="
+        "(SELECT MAX(x.assignment_version) FROM program_task_role_evidence x WHERE x.task_id=t.id) "
+        "LEFT JOIN program_lifecycle l ON l.root_id=t.orchestration_root_id WHERE t.id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["orchestration_policy"] is None:
+        return
+    policy = OrchestrationPolicy.from_json(row["orchestration_policy"])
+    if policy.version != 3:
+        return
+    if expected_run_id is None:
+        raise ValueError("managed v3 completion requires expected_run_id")
+    digest = policy.policy_digest
+    generation = row["lifecycle_generation"]
+    if any((
+        row["status"] != "running", row["current_run_id"] != expected_run_id,
+        row["run_status"] != "running", row["run_ended"] is not None,
+        row["assignee"] != row["run_profile"], row["assignee"] != row["admission_profile"],
+        row["assignee"] != row["assignment_profile"], row["program_role"] != row["run_role"],
+        row["program_role"] != row["admission_role"], row["program_role"] != row["assignment_role"],
+        row["orchestration_policy_digest"] != digest, row["run_digest"] != digest,
+        row["admission_digest"] != digest, row["assignment_digest"] != digest,
+        row["orchestration_root_id"] != row["admission_root"],
+        row["orchestration_root_id"] != row["assignment_root"],
+        row["run_generation"] != generation, row["admission_generation"] != generation,
+        row["assignment_generation"] != generation,
+        policy.role_for_profile(row["assignee"]) != row["program_role"],
+    )):
+        raise ValueError("managed v3 completion role/run admission evidence mismatch")
+    if row["id"] == row["orchestration_root_id"]:
+        deliveries = conn.execute(
+            "SELECT * FROM program_deliveries WHERE root_id=?", (task_id,)
+        ).fetchall()
+        if len(deliveries) != 1 or deliveries[0]["state"] != "candidate":
+            raise ValueError("program root completion requires exact candidate delivery")
+        _assert_program_delivery_history(conn, deliveries[0])
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6782,6 +7936,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    _assert_managed_completion_authority(conn, task_id, expected_run_id)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -6814,6 +7969,11 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # The earlier validation gives callers a fast, precise error, but it
+        # cannot authorize the write: another connection may end/reclaim the
+        # run before BEGIN IMMEDIATE. Recheck every managed-run invariant
+        # while holding the same write transaction as the completion CAS.
+        _assert_managed_completion_authority(conn, task_id, expected_run_id)
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -10527,11 +11687,18 @@ def _dispatch_once_locked(
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
     review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "SELECT child.id, child.assignee, root.orchestration_policy AS root_policy "
+        "FROM tasks child LEFT JOIN tasks root ON root.id=child.orchestration_root_id "
+        "WHERE child.status = 'review' AND child.claim_lock IS NULL "
+        "ORDER BY child.priority DESC, child.created_at ASC"
     ).fetchall()
     for row in review_rows:
+        if row["root_policy"] is not None:
+            try:
+                if OrchestrationPolicy.from_json(row["root_policy"]).version == 3:
+                    continue
+            except (TypeError, ValueError):
+                continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         if not row["assignee"]:
@@ -11677,7 +12844,7 @@ def gc_events(
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? AND kind <> 'completed' AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
             (cutoff,),
         )
