@@ -131,6 +131,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Trusted Mission Control may extend a deadline, but never beyond this hard
 # lifetime from the immutable root creation instant.
 PROGRAM_MAX_TOTAL_WALL_CLOCK_SECONDS = 30 * 24 * 60 * 60
+PROGRAM_MAX_CHANGE_REQUESTS = 10_000
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -844,61 +845,46 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+PROGRAM_ROLES = (
+    "orchestrator",
+    "writer",
+    "integrator",
+    "reviewer",
+    "security_reviewer",
+    "qa_verifier",
+)
+_PROGRAM_ROLE_SET = frozenset(PROGRAM_ROLES)
+
+
 @dataclass(frozen=True)
 class OrchestrationPolicy:
-    """Immutable, bounded authority for one dynamically expanded program.
+    """Exact persisted orchestration authority (legacy v1/v2 or role-bound v3)."""
 
-    Version 2 adds execution budgets.  A1 was never released, but persisted
-    development databases may contain its exact five-key JSON document;
-    ``from_json`` deliberately upgrades that shape to conservative bounded
-    defaults.  Every new serialization is an exact, explicitly-versioned v2
-    document so future compatibility cannot emerge from accidental parsing.
-    """
-
-    allowed_assignees: tuple[str, ...]
-    orchestrator_assignees: tuple[str, ...]
-    max_depth: int
-    max_tasks: int
-    max_runtime_seconds: int
+    allowed_assignees: tuple[str, ...] = ()
+    orchestrator_assignees: tuple[str, ...] = ()
+    max_depth: int = 1
+    max_tasks: int = 1
+    max_runtime_seconds: int = 1
     max_concurrency: int = 1
     max_wall_clock_seconds: int = 86_400
     goal_max_turns: int = 20
+    version: int = 2
+    role_bindings: tuple[tuple[str, str], ...] = ()
+    max_active_by_role: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.allowed_assignees, (list, tuple))
-            or not isinstance(self.orchestrator_assignees, (list, tuple))
-            or any(type(item) is not str for item in self.allowed_assignees)
-            or any(type(item) is not str for item in self.orchestrator_assignees)
-            or any(
-                type(value) is not int
-                for value in (
-                    self.max_depth,
-                    self.max_tasks,
-                    self.max_runtime_seconds,
-                    self.max_concurrency,
-                    self.max_wall_clock_seconds,
-                    self.goal_max_turns,
-                )
+        if type(self.version) is not int or self.version not in (2, 3) or any(
+            type(value) is not int
+            for value in (
+                self.max_depth,
+                self.max_tasks,
+                self.max_runtime_seconds,
+                self.max_concurrency,
+                self.max_wall_clock_seconds,
+                self.goal_max_turns,
             )
         ):
             raise ValueError("malformed orchestration policy")
-        assignees = tuple(
-            dict.fromkeys(_canonical_assignee(a) for a in self.allowed_assignees)
-        )
-        orchestrators = tuple(
-            dict.fromkeys(_canonical_assignee(a) for a in self.orchestrator_assignees)
-        )
-        if len(assignees) != len(self.allowed_assignees):
-            raise ValueError("allowed_assignees must not contain duplicates")
-        if len(orchestrators) != len(self.orchestrator_assignees):
-            raise ValueError("orchestrator_assignees must not contain duplicates")
-        if not assignees or any(not a for a in assignees) or len(assignees) > 64:
-            raise ValueError("allowed_assignees must contain 1 to 64 profile names")
-        if not orchestrators or any(not a for a in orchestrators):
-            raise ValueError("orchestrator_assignees must contain profile names")
-        if not set(orchestrators).issubset(assignees):
-            raise ValueError("orchestrator_assignees must be a subset of allowed_assignees")
         if not 1 <= self.max_depth <= 32:
             raise ValueError("max_depth must be between 1 and 32")
         if not 1 <= self.max_tasks <= 10_000:
@@ -911,44 +897,200 @@ class OrchestrationPolicy:
             raise ValueError("max_wall_clock_seconds must be between 1 and 86400")
         if not 1 <= self.goal_max_turns <= 20:
             raise ValueError("goal_max_turns must be between 1 and 20")
-        object.__setattr__(self, "allowed_assignees", assignees)
-        object.__setattr__(self, "orchestrator_assignees", orchestrators)
+
+        if self.version == 2:
+            if self.role_bindings or self.max_active_by_role:
+                raise ValueError("role_policy_required")
+            if (
+                not isinstance(self.allowed_assignees, (list, tuple))
+                or not isinstance(self.orchestrator_assignees, (list, tuple))
+                or any(type(item) is not str for item in self.allowed_assignees)
+                or any(type(item) is not str for item in self.orchestrator_assignees)
+            ):
+                raise ValueError("malformed orchestration policy")
+            assignees = tuple(_canonical_assignee(a) for a in self.allowed_assignees)
+            orchestrators = tuple(
+                _canonical_assignee(a) for a in self.orchestrator_assignees
+            )
+            if len(set(assignees)) != len(assignees):
+                raise ValueError("allowed_assignees must not contain duplicates")
+            if len(set(orchestrators)) != len(orchestrators):
+                raise ValueError("orchestrator_assignees must not contain duplicates")
+            if not assignees or any(not a for a in assignees) or len(assignees) > 64:
+                raise ValueError("allowed_assignees must contain 1 to 64 profile names")
+            if not orchestrators or any(not a for a in orchestrators):
+                raise ValueError("orchestrator_assignees must contain profile names")
+            if not set(orchestrators).issubset(assignees):
+                raise ValueError(
+                    "orchestrator_assignees must be a subset of allowed_assignees"
+                )
+            object.__setattr__(self, "allowed_assignees", assignees)
+            object.__setattr__(self, "orchestrator_assignees", orchestrators)
+            return
+
+        if self.allowed_assignees or self.orchestrator_assignees:
+            raise ValueError("v3 policy must not contain legacy assignee authority")
+        if not isinstance(self.role_bindings, (list, tuple)) or not isinstance(
+            self.max_active_by_role, (list, tuple)
+        ):
+            raise ValueError("malformed orchestration policy")
+        bindings: list[tuple[str, str]] = []
+        for binding in self.role_bindings:
+            if (
+                not isinstance(binding, (list, tuple))
+                or len(binding) != 2
+                or any(type(item) is not str for item in binding)
+            ):
+                raise ValueError("malformed role binding")
+            profile = _canonical_assignee(binding[0])
+            role = binding[1]
+            if not profile or role not in _PROGRAM_ROLE_SET:
+                raise ValueError("unknown or malformed program role")
+            bindings.append((profile, role))
+        profiles = [profile for profile, _ in bindings]
+        if len(profiles) != len(set(profiles)):
+            raise ValueError("duplicate profile role binding")
+        if not bindings or len(bindings) > 64:
+            raise ValueError("role_bindings must contain 1 to 64 profiles")
+        role_counts = {
+            role: sum(binding_role == role for _, binding_role in bindings)
+            for role in PROGRAM_ROLES
+        }
+        for required in ("orchestrator", "writer", "reviewer", "qa_verifier"):
+            if role_counts[required] < 1:
+                raise ValueError(f"at least one {required} role binding is required")
+        if role_counts["integrator"] != 1:
+            raise ValueError("exactly one integrator role binding is required")
+
+        limits: list[tuple[str, int]] = []
+        for item in self.max_active_by_role:
+            if (
+                not isinstance(item, (list, tuple))
+                or len(item) != 2
+                or type(item[0]) is not str
+                or type(item[1]) is not int
+            ):
+                raise ValueError("malformed max_active_by_role")
+            limits.append((item[0], item[1]))
+        limit_map = dict(limits)
+        if len(limits) != len(limit_map) or set(limit_map) != _PROGRAM_ROLE_SET:
+            raise ValueError("max_active_by_role must contain every role exactly once")
+        if limit_map["integrator"] != 1:
+            raise ValueError("integrator active limit must equal 1")
+        for role, limit in limit_map.items():
+            count = role_counts[role]
+            if limit < 0 or limit > count or (count > 0 and limit < 1):
+                raise ValueError(f"invalid active limit for {role} role")
+            if limit > self.max_concurrency:
+                raise ValueError("role limit exceeds global concurrency")
+        if sum(limit_map.values()) > self.max_concurrency:
+            raise ValueError("sum of role limits exceeds global concurrency")
+        object.__setattr__(self, "role_bindings", tuple(bindings))
+        object.__setattr__(
+            self,
+            "max_active_by_role",
+            tuple((role, limit_map[role]) for role in PROGRAM_ROLES),
+        )
+
+    def _document(self) -> dict[str, Any]:
+        common = {
+            "version": self.version,
+            "max_depth": self.max_depth,
+            "max_tasks": self.max_tasks,
+            "max_runtime_seconds": self.max_runtime_seconds,
+            "max_concurrency": self.max_concurrency,
+            "max_wall_clock_seconds": self.max_wall_clock_seconds,
+            "goal_max_turns": self.goal_max_turns,
+        }
+        if self.version == 2:
+            return {
+                **common,
+                "allowed_assignees": list(self.allowed_assignees),
+                "orchestrator_assignees": list(self.orchestrator_assignees),
+            }
+        return {
+            **common,
+            "role_bindings": [
+                {"profile": profile, "role": role}
+                for profile, role in self.role_bindings
+            ],
+            "max_active_by_role": dict(self.max_active_by_role),
+        }
 
     def to_json(self) -> str:
         return json.dumps(
-            {
-                "version": 2,
-                "allowed_assignees": list(self.allowed_assignees),
-                "orchestrator_assignees": list(self.orchestrator_assignees),
-                "max_depth": self.max_depth,
-                "max_tasks": self.max_tasks,
-                "max_runtime_seconds": self.max_runtime_seconds,
-                "max_concurrency": self.max_concurrency,
-                "max_wall_clock_seconds": self.max_wall_clock_seconds,
-                "goal_max_turns": self.goal_max_turns,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
+            self._document(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
         )
+
+    @property
+    def policy_digest(self) -> str:
+        return "sha256:" + hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
+    def role_for_profile(self, profile: str) -> str:
+        if self.version != 3:
+            raise ValueError("role_policy_required")
+        canonical = _canonical_assignee(profile)
+        for bound_profile, role in self.role_bindings:
+            if bound_profile == canonical:
+                return role
+        raise ValueError("profile is not bound by orchestration role policy")
+
+    def max_active_for_role(self, role: str) -> int:
+        if self.version != 3:
+            raise ValueError("role_policy_required")
+        if role not in _PROGRAM_ROLE_SET:
+            raise ValueError("unknown program role")
+        return dict(self.max_active_by_role)[role]
 
     @classmethod
     def from_json(cls, value: str) -> "OrchestrationPolicy":
         try:
             data = json.loads(value)
             a1_keys = {
-                "allowed_assignees",
-                "orchestrator_assignees",
-                "max_depth",
-                "max_tasks",
-                "max_runtime_seconds",
+                "allowed_assignees", "orchestrator_assignees", "max_depth",
+                "max_tasks", "max_runtime_seconds",
             }
             v2_keys = a1_keys | {
                 "version", "max_concurrency", "max_wall_clock_seconds",
                 "goal_max_turns",
             }
-            if not isinstance(data, dict) or set(data) not in (a1_keys, v2_keys):
+            v3_keys = {
+                "version", "role_bindings", "max_active_by_role", "max_depth",
+                "max_tasks", "max_runtime_seconds", "max_concurrency",
+                "max_wall_clock_seconds", "goal_max_turns",
+            }
+            if not isinstance(data, dict) or set(data) not in (a1_keys, v2_keys, v3_keys):
                 raise ValueError
             is_a1 = set(data) == a1_keys
+            if set(data) == v3_keys:
+                if data.get("version") != 3 or type(data.get("version")) is not int:
+                    raise ValueError
+                raw_bindings = data["role_bindings"]
+                raw_limits = data["max_active_by_role"]
+                if (
+                    not isinstance(raw_bindings, list)
+                    or any(
+                        not isinstance(item, dict)
+                        or set(item) != {"profile", "role"}
+                        or type(item["profile"]) is not str
+                        or type(item["role"]) is not str
+                        for item in raw_bindings
+                    )
+                    or not isinstance(raw_limits, dict)
+                ):
+                    raise ValueError
+                return cls(
+                    version=3,
+                    role_bindings=tuple(
+                        (item["profile"], item["role"]) for item in raw_bindings
+                    ),
+                    max_active_by_role=tuple(raw_limits.items()),
+                    max_depth=data["max_depth"], max_tasks=data["max_tasks"],
+                    max_runtime_seconds=data["max_runtime_seconds"],
+                    max_concurrency=data["max_concurrency"],
+                    max_wall_clock_seconds=data["max_wall_clock_seconds"],
+                    goal_max_turns=data["goal_max_turns"],
+                )
             if not is_a1 and (type(data["version"]) is not int or data["version"] != 2):
                 raise ValueError
             if (
@@ -967,8 +1109,7 @@ class OrchestrationPolicy:
             return cls(
                 allowed_assignees=tuple(data["allowed_assignees"]),
                 orchestrator_assignees=tuple(data["orchestrator_assignees"]),
-                max_depth=data["max_depth"],
-                max_tasks=data["max_tasks"],
+                max_depth=data["max_depth"], max_tasks=data["max_tasks"],
                 max_runtime_seconds=data["max_runtime_seconds"],
                 max_concurrency=1 if is_a1 else data["max_concurrency"],
                 max_wall_clock_seconds=86_400 if is_a1 else data["max_wall_clock_seconds"],
@@ -1069,6 +1210,8 @@ class Task:
     orchestration_root_id: Optional[str] = None
     orchestration_depth: Optional[int] = None
     orchestration_parent_id: Optional[str] = None
+    program_role: Optional[str] = None
+    orchestration_policy_digest: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1167,6 +1310,11 @@ class Task:
                 row["orchestration_parent_id"]
                 if "orchestration_parent_id" in keys else None
             ),
+            program_role=row["program_role"] if "program_role" in keys else None,
+            orchestration_policy_digest=(
+                row["orchestration_policy_digest"]
+                if "orchestration_policy_digest" in keys else None
+            ),
         )
 
 
@@ -1197,6 +1345,9 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    program_role: Optional[str] = None
+    orchestration_policy_digest: Optional[str] = None
+    evidence_generation: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1221,6 +1372,17 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            program_role=(
+                row["program_role"] if "program_role" in row.keys() else None
+            ),
+            orchestration_policy_digest=(
+                row["orchestration_policy_digest"]
+                if "orchestration_policy_digest" in row.keys() else None
+            ),
+            evidence_generation=(
+                row["evidence_generation"]
+                if "evidence_generation" in row.keys() else None
+            ),
         )
 
 
@@ -1288,6 +1450,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     program_create_fingerprint TEXT,
     program_control_version INTEGER NOT NULL DEFAULT 0,
     orchestration_policy TEXT,
+    program_role         TEXT CHECK (program_role IS NULL OR program_role IN (
+        'orchestrator','writer','integrator','reviewer','security_reviewer','qa_verifier')),
+    orchestration_policy_digest TEXT,
+    evidence_generation INTEGER,
     orchestration_root_id TEXT,
     orchestration_depth  INTEGER,
     orchestration_parent_id TEXT,
@@ -1387,6 +1553,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id             TEXT NOT NULL,
     profile             TEXT,
+    program_role        TEXT CHECK (program_role IS NULL OR program_role IN (
+        'orchestrator','writer','integrator','reviewer','security_reviewer','qa_verifier')),
+    orchestration_policy_digest TEXT,
+    evidence_generation INTEGER,
     step_key            TEXT,
     status              TEXT NOT NULL,
     -- status: running | done | blocked | crashed | timed_out | failed | released
@@ -1447,6 +1617,7 @@ CREATE TABLE IF NOT EXISTS program_lifecycle (
     effective_deadline  INTEGER NOT NULL,
     archived_at         INTEGER,
     archive_actor       TEXT,
+    evidence_generation INTEGER NOT NULL DEFAULT 0,
     created_at          INTEGER NOT NULL,
     updated_at          INTEGER NOT NULL
 );
@@ -1498,6 +1669,25 @@ CREATE TABLE IF NOT EXISTS program_change_request_events (
     payload_json        TEXT NOT NULL,
     created_at          INTEGER NOT NULL,
     UNIQUE (request_id, event_type)
+);
+
+CREATE TABLE IF NOT EXISTS program_task_role_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+    assignment_version INTEGER NOT NULL CHECK (assignment_version >= 1),
+    profile TEXT NOT NULL,
+    program_role TEXT NOT NULL CHECK (program_role IN (
+        'orchestrator','writer','integrator','reviewer','security_reviewer','qa_verifier')),
+    policy_digest TEXT NOT NULL, root_id TEXT NOT NULL,
+    evidence_generation INTEGER NOT NULL CHECK (evidence_generation >= 0),
+    created_at INTEGER NOT NULL, UNIQUE (task_id, assignment_version)
+);
+CREATE TABLE IF NOT EXISTS program_run_admission_evidence (
+    run_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, profile TEXT NOT NULL,
+    program_role TEXT NOT NULL CHECK (program_role IN (
+        'orchestrator','writer','integrator','reviewer','security_reviewer','qa_verifier')),
+    policy_digest TEXT NOT NULL, root_id TEXT NOT NULL,
+    evidence_generation INTEGER NOT NULL CHECK (evidence_generation >= 0),
+    admitted_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS program_operator_hints (
@@ -1568,6 +1758,18 @@ BEGIN SELECT RAISE(ABORT, 'program change audit is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_program_change_request_events_no_delete
 BEFORE DELETE ON program_change_request_events
 BEGIN SELECT RAISE(ABORT, 'program change audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_task_role_evidence_no_update
+BEFORE UPDATE ON program_task_role_evidence
+BEGIN SELECT RAISE(ABORT, 'program role evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_task_role_evidence_no_delete
+BEFORE DELETE ON program_task_role_evidence
+BEGIN SELECT RAISE(ABORT, 'program role evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_run_admission_evidence_no_update
+BEFORE UPDATE ON program_run_admission_evidence
+BEGIN SELECT RAISE(ABORT, 'program run evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_run_admission_evidence_no_delete
+BEFORE DELETE ON program_run_admission_evidence
+BEGIN SELECT RAISE(ABORT, 'program run evidence is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_program_operator_hints_no_update
 BEFORE UPDATE ON program_operator_hints
 BEGIN SELECT RAISE(ABORT, 'program hint audit is append-only'); END;
@@ -1590,6 +1792,8 @@ _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS = frozenset(
         "idx_program_lifecycle_events_root",
         "program_change_requests",
         "program_change_request_events",
+        "program_task_role_evidence",
+        "program_run_admission_evidence",
         "program_operator_hints",
         "program_decisions",
         "program_decision_options",
@@ -1605,6 +1809,10 @@ _PROGRAM_SCHEMA_TRIGGER_OBJECTS = frozenset(
         "trg_program_lifecycle_events_no_delete",
         "trg_program_change_request_events_no_update",
         "trg_program_change_request_events_no_delete",
+        "trg_program_task_role_evidence_no_update",
+        "trg_program_task_role_evidence_no_delete",
+        "trg_program_run_admission_evidence_no_update",
+        "trg_program_run_admission_evidence_no_delete",
         "trg_program_operator_hints_no_update",
         "trg_program_operator_hints_no_delete",
         "trg_program_decision_events_no_update",
@@ -1613,6 +1821,16 @@ _PROGRAM_SCHEMA_TRIGGER_OBJECTS = frozenset(
 )
 _PROGRAM_SCHEMA_OBJECTS = (
     _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS | _PROGRAM_SCHEMA_TRIGGER_OBJECTS
+)
+_PROGRAM_SCHEMA_P2A_OBJECTS = frozenset(
+    name for name in _PROGRAM_SCHEMA_OBJECTS
+    if name not in {
+        "program_task_role_evidence", "program_run_admission_evidence",
+        "trg_program_task_role_evidence_no_update",
+        "trg_program_task_role_evidence_no_delete",
+        "trg_program_run_admission_evidence_no_update",
+        "trg_program_run_admission_evidence_no_delete",
+    }
 )
 _PROGRAM_SCHEMA_PREDECESSOR_OBJECTS = frozenset(
     {
@@ -1665,13 +1883,13 @@ def _canonical_program_schema_signatures() -> dict[str, tuple[str, str, str]]:
     return _PROGRAM_SCHEMA_SIGNATURES
 
 
-def _preflight_program_schema(path: Path) -> None:
+def _preflight_program_schema(path: Path) -> bool:
     """Reject reserved lifecycle near-shapes before opening the DB for writes."""
     try:
         if not path.exists() or path.stat().st_size == 0:
-            return
+            return False
     except OSError:
-        return
+        return False
     with tempfile.TemporaryDirectory(prefix="hermes-kanban-preflight-") as temp_dir:
         snapshot = Path(temp_dir) / path.name
         shutil.copy2(path, snapshot)
@@ -1692,7 +1910,7 @@ def _preflight_program_schema(path: Path) -> None:
                 # This preflight classifies only readable lifecycle schemas.
                 # Preserve the existing corruption/quarantine path as the
                 # single authority for malformed SQLite files.
-                return
+                return False
         finally:
             probe.close()
     actual = {
@@ -1706,11 +1924,26 @@ def _preflight_program_schema(path: Path) -> None:
         _PROGRAM_SCHEMA_PHASE1_OBJECTS | _PROGRAM_SCHEMA_PHASE1_TRIGGERS,
         _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS,
         _PROGRAM_SCHEMA_OBJECTS,
+        _PROGRAM_SCHEMA_P2A_OBJECTS,
     }:
         raise ValueError("unsupported program lifecycle schema")
     canonical = _canonical_program_schema_signatures()
-    if any(actual[name] != canonical[name] for name in names):
+    prior_lifecycle_sql = _normalize_schema_sql(
+        "CREATE TABLE program_lifecycle (root_id TEXT PRIMARY KEY, "
+        "root_fingerprint TEXT NOT NULL, initial_deadline INTEGER NOT NULL, "
+        "effective_deadline INTEGER NOT NULL, archived_at INTEGER, "
+        "archive_actor TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
+    )
+    current_matches = all(actual[name] == canonical[name] for name in names)
+    exact_p2a = (
+        names == _PROGRAM_SCHEMA_P2A_OBJECTS
+        and actual["program_lifecycle"]
+        == ("table", "program_lifecycle", prior_lifecycle_sql)
+        and all(actual[name] == canonical[name] for name in names if name != "program_lifecycle")
+    )
+    if not current_matches and not exact_p2a:
         raise ValueError("unsupported program lifecycle schema")
+    return current_matches
 
 
 # ---------------------------------------------------------------------------
@@ -2155,6 +2388,12 @@ def connect(
     # (no schema/migration writes run), so skip it entirely and just open the
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
     resolved = str(path.resolve())
+    # Reserved security namespaces are revalidated on every reconnect. A raw
+    # SQLite writer can change sqlite_master without touching this process's
+    # initialization cache, so a path-only cache is not an authority signal.
+    schema_is_current = _preflight_program_schema(path)
+    if resolved in _INITIALIZED_PATHS and not schema_is_current:
+        _INITIALIZED_PATHS.discard(resolved)
     if resolved in _INITIALIZED_PATHS:
         conn = _sqlite_connect(path)
         try:
@@ -2295,6 +2534,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    lifecycle_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(program_lifecycle)")
+    }
+    if lifecycle_cols and "evidence_generation" not in lifecycle_cols:
+        _add_column_if_missing(
+            conn,
+            "program_lifecycle",
+            "evidence_generation",
+            "evidence_generation INTEGER NOT NULL DEFAULT 0",
+        )
+        conn.execute(
+            "UPDATE program_lifecycle SET evidence_generation = ("
+            "SELECT COUNT(*) FROM program_lifecycle_events e "
+            "WHERE e.root_id = program_lifecycle.root_id)"
+        )
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -2445,6 +2699,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "orchestration_policy", "orchestration_policy TEXT"
         )
+    if "program_role" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "program_role",
+            "program_role TEXT CHECK (program_role IS NULL OR program_role IN "
+            "('orchestrator','writer','integrator','reviewer','security_reviewer','qa_verifier'))",
+        )
+    if "orchestration_policy_digest" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "orchestration_policy_digest",
+            "orchestration_policy_digest TEXT",
+        )
+    if "evidence_generation" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "evidence_generation", "evidence_generation INTEGER"
+        )
     if "orchestration_root_id" not in cols:
         _add_column_if_missing(
             conn, "tasks", "orchestration_root_id", "orchestration_root_id TEXT"
@@ -2510,6 +2783,59 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "program_role" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "program_role",
+                "program_role TEXT CHECK (program_role IS NULL OR program_role IN "
+                "('orchestrator','writer','integrator','reviewer','security_reviewer','qa_verifier'))",
+            )
+        if "orchestration_policy_digest" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "orchestration_policy_digest",
+                "orchestration_policy_digest TEXT",
+            )
+        if "evidence_generation" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "evidence_generation",
+                "evidence_generation INTEGER",
+            )
+        # Exact P2A predecessor migration: seal the role/admission snapshot
+        # before any later mutable-row authority check can trust it.
+        conn.execute(
+            "INSERT OR IGNORE INTO program_task_role_evidence "
+            "(task_id, assignment_version, profile, program_role, policy_digest, "
+            "root_id, evidence_generation, created_at) "
+            "SELECT t.id, 1, t.assignee, t.program_role, t.orchestration_policy_digest, "
+            "t.orchestration_root_id, COALESCE(t.evidence_generation, l.evidence_generation, 0), "
+            "t.created_at FROM tasks t LEFT JOIN program_lifecycle l "
+            "ON l.root_id=t.orchestration_root_id WHERE t.program_role IS NOT NULL "
+            "AND t.assignee IS NOT NULL AND t.orchestration_policy_digest IS NOT NULL "
+            "AND t.orchestration_root_id IS NOT NULL"
+        )
+        conn.execute(
+            "UPDATE tasks SET evidence_generation = COALESCE(evidence_generation, "
+            "(SELECT evidence_generation FROM program_lifecycle l "
+            "WHERE l.root_id=tasks.orchestration_root_id), 0) WHERE program_role IS NOT NULL"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO program_run_admission_evidence "
+            "(run_id, task_id, profile, program_role, policy_digest, root_id, "
+            "evidence_generation, admitted_at) SELECT r.id, r.task_id, r.profile, "
+            "r.program_role, r.orchestration_policy_digest, t.orchestration_root_id, "
+            "r.evidence_generation, r.started_at FROM task_runs r JOIN tasks t ON t.id=r.task_id "
+            "WHERE r.program_role IS NOT NULL AND r.profile IS NOT NULL "
+            "AND r.orchestration_policy_digest IS NOT NULL AND r.evidence_generation IS NOT NULL "
+            "AND t.orchestration_root_id IS NOT NULL"
+        )
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -2606,7 +2932,10 @@ _REBUILD_SPECS = {
     "task_runs": (
         "CREATE TABLE task_runs ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
+        " task_id TEXT NOT NULL, profile TEXT,"
+        " program_role TEXT CHECK (program_role IS NULL OR program_role IN "
+        "('orchestrator','writer','integrator','reviewer','security_reviewer','qa_verifier')) ,"
+        " orchestration_policy_digest TEXT, evidence_generation INTEGER, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
@@ -2929,6 +3258,7 @@ def create_task(
     orchestration_policy: Optional[OrchestrationPolicy] = None,
     current_orchestrator_task_id: Optional[str] = None,
     creation_authority: Optional[CreationAuthority] = None,
+    program_role: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2954,6 +3284,8 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    if program_role is not None and program_role not in _PROGRAM_ROLE_SET:
+        raise ValueError("unknown program role")
     if orchestration_policy is not None and not isinstance(
         orchestration_policy, OrchestrationPolicy
     ):
@@ -3103,6 +3435,8 @@ def create_task(
         try:
             with write_txn(conn):
                 policy = orchestration_policy
+                effective_program_role = program_role
+                orchestration_policy_digest = None
                 orchestration_root_id = None
                 orchestration_depth = None
                 orchestration_parent_id = None
@@ -3133,7 +3467,24 @@ def create_task(
                     ):
                         raise ValueError("missing active orchestration authority")
                     active = conn.execute(
-                        "SELECT 1 FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+                        "SELECT t.program_role AS task_role, "
+                        "t.orchestration_policy_digest AS task_digest, "
+                        "t.evidence_generation AS task_generation, "
+                        "t.orchestration_root_id AS root_id, "
+                        "r.program_role AS run_role, "
+                        "r.orchestration_policy_digest AS run_digest, "
+                        "r.evidence_generation AS run_generation, "
+                        "te.profile AS task_evidence_profile, te.program_role AS task_evidence_role, "
+                        "te.policy_digest AS task_evidence_digest, te.root_id AS task_evidence_root, "
+                        "te.evidence_generation AS task_evidence_generation, "
+                        "re.profile AS run_evidence_profile, re.program_role AS run_evidence_role, "
+                        "re.policy_digest AS run_evidence_digest, re.root_id AS run_evidence_root, "
+                        "re.evidence_generation AS run_evidence_generation "
+                        "FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+                        "LEFT JOIN program_task_role_evidence te ON te.task_id=t.id AND "
+                        "te.assignment_version=(SELECT MAX(x.assignment_version) "
+                        "FROM program_task_role_evidence x WHERE x.task_id=t.id) "
+                        "LEFT JOIN program_run_admission_evidence re ON re.run_id=r.id "
                         "WHERE t.id = ? AND t.status = 'running' "
                         "AND t.current_run_id = ? AND t.claim_lock = ? "
                         "AND t.assignee = ? AND r.task_id = t.id "
@@ -3153,8 +3504,52 @@ def create_task(
                         or active is None
                     ):
                         raise ValueError("missing or stale active orchestration authority")
-                    if creation_authority.actor_profile not in policy.orchestrator_assignees:
-                        raise ValueError("profile is not allowed to orchestrate")
+                    if policy.version == 3:
+                        authority_root = _program_root_row(conn, active["root_id"])
+                        authority_lifecycle = _ensure_program_lifecycle(
+                            conn, authority_root, policy, now
+                        )
+                        current_generation = int(authority_lifecycle["evidence_generation"])
+                        if (
+                            active["task_generation"] != current_generation
+                            or active["run_generation"] != current_generation
+                            or active["task_evidence_generation"] != current_generation
+                            or active["run_evidence_generation"] != current_generation
+                        ):
+                            raise ValueError("stale orchestration evidence generation")
+                        if (
+                            active["task_evidence_profile"] != creation_authority.actor_profile
+                            or active["run_evidence_profile"] != creation_authority.actor_profile
+                            or active["task_evidence_role"] != active["task_role"]
+                            or active["run_evidence_role"] != active["run_role"]
+                            or active["task_evidence_digest"] != active["task_digest"]
+                            or active["run_evidence_digest"] != active["run_digest"]
+                            or active["task_evidence_root"] != active["root_id"]
+                            or active["run_evidence_root"] != active["root_id"]
+                        ):
+                            raise ValueError("orchestration role evidence integrity check failed")
+                        if effective_program_role is None:
+                            raise ValueError("program_role is required for v3 child creation")
+                        v3_assignee = assignee
+                        if v3_assignee is None:
+                            raise ValueError("assignee is required for v3 child creation")
+                        if (
+                            active["task_role"] != "orchestrator"
+                            or active["run_role"] != "orchestrator"
+                            or active["task_digest"] != policy.policy_digest
+                            or active["run_digest"] != policy.policy_digest
+                            or policy.role_for_profile(creation_authority.actor_profile)
+                            != "orchestrator"
+                        ):
+                            raise ValueError("active run is not an orchestrator authority")
+                        if policy.role_for_profile(v3_assignee) != effective_program_role:
+                            raise ValueError("assignee does not match requested program role")
+                        orchestration_policy_digest = policy.policy_digest
+                    else:
+                        if effective_program_role is not None:
+                            raise ValueError("role_policy_required")
+                        if creation_authority.actor_profile not in policy.orchestrator_assignees:
+                            raise ValueError("profile is not allowed to orchestrate")
                     orchestration_root_id = authority.orchestration_root_id
                     orchestration_parent_id = authority.id
                     if not orchestration_root_id or authority.orchestration_depth is None:
@@ -3189,6 +3584,13 @@ def create_task(
                     orchestration_depth = 0
                     max_runtime_seconds = policy.max_runtime_seconds
                     goal_max_turns = policy.goal_max_turns
+                    if policy.version == 3:
+                        if effective_program_role not in (None, "orchestrator"):
+                            raise ValueError("v3 program root role must be orchestrator")
+                        effective_program_role = "orchestrator"
+                        orchestration_policy_digest = policy.policy_digest
+                    elif effective_program_role is not None:
+                        raise ValueError("role_policy_required")
 
                 program_create_fingerprint = None
                 if policy is not None:
@@ -3224,6 +3626,11 @@ def create_task(
                         "orchestration_depth": orchestration_depth,
                         "orchestration_parent_id": orchestration_parent_id,
                     }
+                    if policy.version == 3:
+                        fingerprint_document.update(
+                            program_role=effective_program_role,
+                            orchestration_policy_digest=orchestration_policy_digest,
+                        )
                     canonical_request = json.dumps(
                         fingerprint_document,
                         sort_keys=True,
@@ -3297,6 +3704,7 @@ def create_task(
                     if orchestration_depth == 0:
                         # A new root has no durable lifecycle row yet.
                         deadline = now + policy.max_wall_clock_seconds
+                        task_evidence_generation = 0
                     else:
                         # Child admission is governed by the durable lifecycle
                         # overlay under the same write transaction as insertion.
@@ -3311,6 +3719,7 @@ def create_task(
                         lifecycle = _ensure_program_lifecycle(
                             conn, root, root_policy, now
                         )
+                        task_evidence_generation = int(lifecycle["evidence_generation"])
                         if (
                             root["status"] == "archived"
                             or lifecycle["archived_at"] is not None
@@ -3321,15 +3730,27 @@ def create_task(
                     # no mutation or admission is allowed at ``now >= deadline``.
                     if now >= deadline:
                         raise ValueError("orchestration program deadline exceeded")
-                    if (
-                        orchestration_depth == 0
-                        and assignee not in policy.orchestrator_assignees
-                    ):
-                        raise ValueError(
-                            "root assignee must be allowed to orchestrate"
-                        )
-                    if assignee not in policy.allowed_assignees:
-                        raise ValueError("assignee is not allowed by orchestration policy")
+                    if policy.version == 3:
+                        v3_assignee = assignee
+                        if v3_assignee is None:
+                            raise ValueError("assignee is required by v3 orchestration policy")
+                        if (
+                            orchestration_depth == 0
+                            and policy.role_for_profile(v3_assignee) != "orchestrator"
+                        ):
+                            raise ValueError("root assignee must have orchestrator role")
+                        if policy.role_for_profile(v3_assignee) != effective_program_role:
+                            raise ValueError("assignee does not match requested program role")
+                    else:
+                        if (
+                            orchestration_depth == 0
+                            and assignee not in policy.orchestrator_assignees
+                        ):
+                            raise ValueError(
+                                "root assignee must be allowed to orchestrate"
+                            )
+                        if assignee not in policy.allowed_assignees:
+                            raise ValueError("assignee is not allowed by orchestration policy")
                     if (
                         orchestration_depth is None
                         or orchestration_depth > policy.max_depth
@@ -3407,11 +3828,12 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         program_create_fingerprint,
-                        max_runtime_seconds, orchestration_policy,
+                        max_runtime_seconds, orchestration_policy, program_role,
+                        orchestration_policy_digest, evidence_generation,
                         orchestration_root_id, orchestration_depth,
                         orchestration_parent_id,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3431,6 +3853,12 @@ def create_task(
                         program_create_fingerprint,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         policy.to_json() if policy is not None else None,
+                        effective_program_role,
+                        orchestration_policy_digest,
+                        (
+                            task_evidence_generation
+                            if policy is not None and policy.version == 3 else None
+                        ),
                         orchestration_root_id,
                         orchestration_depth,
                         orchestration_parent_id,
@@ -3441,6 +3869,17 @@ def create_task(
                         session_id,
                     ),
                 )
+                if policy is not None and policy.version == 3:
+                    conn.execute(
+                        "INSERT INTO program_task_role_evidence (task_id, assignment_version, "
+                        "profile, program_role, policy_digest, root_id, evidence_generation, created_at) "
+                        "VALUES (?, 1, ?, ?, ?, ?, ?, ?)",
+                        (
+                            task_id, assignee, effective_program_role,
+                            orchestration_policy_digest, orchestration_root_id,
+                            task_evidence_generation, now,
+                        ),
+                    )
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -3558,7 +3997,7 @@ def _validate_managed_assignee(
 ) -> None:
     """Validate a managed-task assignment before any lifecycle mutation."""
     row = conn.execute(
-        "SELECT orchestration_policy FROM tasks WHERE id = ?", (task_id,)
+        "SELECT orchestration_policy, program_role FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None or row["orchestration_policy"] is None:
         return
@@ -3568,7 +4007,19 @@ def _validate_managed_assignee(
         raise ValueError(
             "cannot reassign managed task: orchestration policy is invalid"
         ) from exc
-    if profile not in policy.allowed_assignees:
+    if policy.version == 3:
+        if row["program_role"] not in _PROGRAM_ROLE_SET:
+            raise ValueError("cannot reassign managed task: invalid program role")
+        target_profile = profile
+        if target_profile is None:
+            raise ValueError("managed task reassignment must preserve the same role")
+        try:
+            target_role = policy.role_for_profile(target_profile)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("managed task reassignment must preserve the same role") from exc
+        if target_role != row["program_role"]:
+            raise ValueError("managed task reassignment must preserve the same role")
+    elif profile not in policy.allowed_assignees:
         raise ValueError(
             "managed task assignee must be one of policy.allowed_assignees"
         )
@@ -3583,7 +4034,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee "
+            "SELECT status, claim_lock, assignee, orchestration_policy, program_role, "
+            "orchestration_policy_digest, orchestration_root_id, evidence_generation "
             "FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
@@ -3594,17 +4046,53 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 "Wait for completion or reclaim the stale lock first."
             )
         _validate_managed_assignee(conn, task_id, profile)
+        role_evidence = None
+        if row["orchestration_policy"] is not None:
+            policy = OrchestrationPolicy.from_json(row["orchestration_policy"])
+            if policy.version == 3:
+                role_evidence = conn.execute(
+                    "SELECT * FROM program_task_role_evidence WHERE task_id=? "
+                    "ORDER BY assignment_version DESC LIMIT 1", (task_id,)
+                ).fetchone()
+                if (
+                    role_evidence is None
+                    or role_evidence["profile"] != row["assignee"]
+                    or role_evidence["program_role"] != row["program_role"]
+                    or role_evidence["policy_digest"] != row["orchestration_policy_digest"]
+                    or role_evidence["root_id"] != row["orchestration_root_id"]
+                    or role_evidence["evidence_generation"] != row["evidence_generation"]
+                ):
+                    raise ValueError("program role evidence integrity check failed")
+                root = _program_root_row(conn, row["orchestration_root_id"])
+                lifecycle = _ensure_program_lifecycle(conn, root, policy, int(time.time()))
+                new_generation = int(lifecycle["evidence_generation"])
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
             # new profile should not inherit the previous profile's streak.
             conn.execute(
-                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+                "UPDATE tasks SET assignee = ?, evidence_generation = COALESCE(?, evidence_generation), "
+                "consecutive_failures = 0, "
                 "last_failure_error = NULL WHERE id = ?",
-                (profile, task_id),
+                (profile, new_generation if role_evidence is not None else None, task_id),
             )
         else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+            conn.execute(
+                "UPDATE tasks SET assignee = ?, evidence_generation=COALESCE(?, evidence_generation) "
+                "WHERE id = ?",
+                (profile, new_generation if role_evidence is not None else None, task_id),
+            )
+        if role_evidence is not None:
+            conn.execute(
+                "INSERT INTO program_task_role_evidence (task_id, assignment_version, profile, "
+                "program_role, policy_digest, root_id, evidence_generation, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id, int(role_evidence["assignment_version"]) + 1, profile,
+                    row["program_role"], row["orchestration_policy_digest"],
+                    row["orchestration_root_id"], new_generation, int(time.time()),
+                ),
+            )
         _append_event(conn, task_id, "assigned", {"assignee": profile})
         return True
 
@@ -4256,6 +4744,29 @@ def _ensure_program_lifecycle(
     ).fetchone()
     if lifecycle is None or lifecycle["root_fingerprint"] != root_fingerprint:
         raise ValueError("program lifecycle root binding mismatch")
+    applied_changes = conn.execute(
+        "SELECT COUNT(*) FROM program_lifecycle_events WHERE root_id = ?",
+        (root_id,),
+    ).fetchone()[0]
+    if lifecycle["evidence_generation"] != applied_changes:
+        raise ValueError("program evidence generation integrity check failed")
+    request_rows = conn.execute(
+        "SELECT * FROM program_change_requests WHERE root_id = ? "
+        "ORDER BY prepared_at, request_id LIMIT ?",
+        (root_id, PROGRAM_MAX_CHANGE_REQUESTS + 1),
+    ).fetchall()
+    if len(request_rows) > PROGRAM_MAX_CHANGE_REQUESTS:
+        raise ValueError("program change request history exceeds limit")
+    orphan_event = conn.execute(
+        "SELECT 1 FROM program_change_request_events e "
+        "LEFT JOIN program_change_requests r ON r.request_id = e.request_id "
+        "WHERE e.root_id = ? AND (r.request_id IS NULL OR r.root_id != e.root_id) LIMIT 1",
+        (root_id,),
+    ).fetchone()
+    if orphan_event is not None:
+        raise ValueError("program change request integrity check failed")
+    for request in request_rows:
+        _verify_prepared_request_anchor(conn, request)
     return lifecycle
 
 
@@ -4942,6 +5453,13 @@ def prepare_program_change_request(
             if existing["prepare_fingerprint"] != prepare_fingerprint:
                 raise ValueError("idempotency key request does not match")
             return {**anchored_result, "status": existing["status"], "replayed": True}
+        at_capacity = conn.execute(
+            "SELECT 1 FROM program_change_requests WHERE root_id = ? "
+            "LIMIT 1 OFFSET ?",
+            (root_id, PROGRAM_MAX_CHANGE_REQUESTS - 1),
+        ).fetchone()
+        if at_capacity is not None:
+            raise ValueError("program change request history exceeds limit")
         if lifecycle["archived_at"] is not None or root["status"] == "archived":
             raise ValueError("archived program cannot be changed")
         if canonical["operation"] == "extend_deadline":
@@ -5041,6 +5559,9 @@ def apply_program_change_request(
         if request["root_id"] != root_id:
             raise ValueError("program change request root binding mismatch")
         canonical_change, _ = _verify_prepared_request_anchor(conn, request)
+        root = _program_root_row(conn, root_id)
+        policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
+        lifecycle = _ensure_program_lifecycle(conn, root, policy, now)
         if request["status"] == "applied":
             if request["apply_fingerprint"] != apply_fingerprint:
                 raise ValueError("program change request was already applied")
@@ -5101,9 +5622,6 @@ def apply_program_change_request(
                     raise ValueError("program change request integrity check failed")
             result["replayed"] = True
             return result
-        root = _program_root_row(conn, root_id)
-        policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
-        lifecycle = _ensure_program_lifecycle(conn, root, policy, now)
         if lifecycle["root_fingerprint"] != request["root_fingerprint"]:
             raise ValueError("program change request root binding mismatch")
         if _program_state_digest(conn, root, lifecycle) != request["prepared_state_digest"]:
@@ -5204,6 +5722,11 @@ def apply_program_change_request(
                     now,
                 ),
             )
+        conn.execute(
+            "UPDATE program_lifecycle SET evidence_generation = evidence_generation + 1, "
+            "updated_at = ? WHERE root_id = ?",
+            (now, root_id),
+        )
         result_json = json.dumps(result, sort_keys=True, separators=(",", ":"))
         cur = conn.execute(
             "UPDATE program_change_requests SET status = 'applied', apply_actor = ?, "
@@ -5314,6 +5837,11 @@ def extend_program_deadline(
                 now,
             ),
         )
+        conn.execute(
+            "UPDATE program_lifecycle SET evidence_generation=evidence_generation+1, "
+            "updated_at=? WHERE root_id=?",
+            (now, root_id),
+        )
     return {
         "root_id": root_id,
         "previous_deadline": previous,
@@ -5402,6 +5930,11 @@ def archive_program(
                 now,
             ),
         )
+        conn.execute(
+            "UPDATE program_lifecycle SET evidence_generation=evidence_generation+1, "
+            "updated_at=? WHERE root_id=?",
+            (now, root_id),
+        )
     return result
 
 
@@ -5416,18 +5949,18 @@ def _program_deadline(
     if row is None or not row["orchestration_policy"]:
         return None, None, False, ""
     root_id = row["orchestration_root_id"]
-    try:
-        policy = OrchestrationPolicy.from_json(row["orchestration_policy"])
-    except ValueError:
-        return None, root_id, True, "program_authority_invalid"
     root = conn.execute(
-        "SELECT t.created_at, l.effective_deadline, l.archived_at "
+        "SELECT t.created_at, t.orchestration_policy, l.effective_deadline, l.archived_at "
         "FROM tasks t LEFT JOIN program_lifecycle l ON l.root_id = t.id "
         "WHERE t.id = ?",
         (root_id,),
     ).fetchone()
-    if root is None:
-        return policy, root_id, True, "program_authority_invalid"
+    if root is None or not root["orchestration_policy"]:
+        return None, root_id, True, "program_authority_invalid"
+    try:
+        policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
+    except ValueError:
+        return None, root_id, True, "program_authority_invalid"
     if root["archived_at"] is not None:
         return policy, root_id, True, "program_archived"
     deadline = (
@@ -5479,7 +6012,64 @@ def _admit_program_run(
         "AND r.ended_at IS NULL",
         (root_id,),
     ).fetchone()[0]
-    return active < policy.max_concurrency
+    if active >= policy.max_concurrency:
+        return False
+    if policy.version != 3:
+        return True
+    task = conn.execute(
+        "SELECT assignee, program_role, orchestration_policy_digest, evidence_generation, "
+        "orchestration_root_id, orchestration_policy FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    root = conn.execute("SELECT * FROM tasks WHERE id=?", (root_id,)).fetchone()
+    if task is None or root is None:
+        return False
+    try:
+        root_policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
+        role = task["program_role"]
+        task_evidence = conn.execute(
+            "SELECT * FROM program_task_role_evidence WHERE task_id=? "
+            "ORDER BY assignment_version DESC LIMIT 1", (task_id,)
+        ).fetchone()
+        if (
+            root_policy.version != 3
+            or root_policy != policy
+            or task["orchestration_policy"] != root["orchestration_policy"]
+            or role not in _PROGRAM_ROLE_SET
+            or task["orchestration_policy_digest"] != root_policy.policy_digest
+            or root["orchestration_policy_digest"] != root_policy.policy_digest
+            or root_policy.role_for_profile(task["assignee"]) != role
+            or task_evidence is None
+            or task_evidence["profile"] != task["assignee"]
+            or task_evidence["program_role"] != role
+            or task_evidence["policy_digest"] != task["orchestration_policy_digest"]
+            or task_evidence["root_id"] != task["orchestration_root_id"]
+            or task_evidence["evidence_generation"] != task["evidence_generation"]
+        ):
+            return False
+        lifecycle = _ensure_program_lifecycle(conn, root, root_policy, now)
+    except (TypeError, ValueError):
+        return False
+    corrupt_active = conn.execute(
+        "SELECT 1 FROM task_runs r JOIN tasks t ON t.id=r.task_id "
+        "LEFT JOIN program_run_admission_evidence e ON e.run_id=r.id "
+        "WHERE t.orchestration_root_id=? AND r.status='running' AND r.ended_at IS NULL "
+        "AND (e.run_id IS NULL OR e.task_id!=r.task_id OR e.profile IS NOT r.profile "
+        "OR e.program_role IS NOT r.program_role OR e.policy_digest IS NOT r.orchestration_policy_digest "
+        "OR e.root_id!=t.orchestration_root_id OR e.evidence_generation IS NOT r.evidence_generation) LIMIT 1",
+        (root_id,),
+    ).fetchone()
+    if corrupt_active is not None:
+        return False
+    active_for_role = conn.execute(
+        "SELECT COUNT(*) FROM task_runs r JOIN program_run_admission_evidence e ON e.run_id=r.id "
+        "WHERE e.root_id=? AND r.status='running' AND r.ended_at IS NULL AND e.program_role=?",
+        (root_id, role),
+    ).fetchone()[0]
+    return (
+        int(lifecycle["evidence_generation"]) == int(task["evidence_generation"])
+        and active_for_role < root_policy.max_active_for_role(role)
+    )
 
 def claim_task(
     conn: sqlite3.Connection,
@@ -5562,7 +6152,10 @@ def claim_task(
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "program_role, orchestration_policy_digest, orchestration_root_id, "
+            "COALESCE((SELECT evidence_generation FROM program_lifecycle "
+            "WHERE root_id=tasks.orchestration_root_id), 0) AS evidence_generation "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5571,8 +6164,9 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
+                program_role, orchestration_policy_digest, evidence_generation,
                 started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5581,10 +6175,24 @@ def claim_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                trow["program_role"] if trow else None,
+                trow["orchestration_policy_digest"] if trow else None,
+                trow["evidence_generation"] if trow else None,
                 now,
             ),
         )
         run_id = run_cur.lastrowid
+        if trow is not None and trow["program_role"] is not None:
+            conn.execute(
+                "INSERT INTO program_run_admission_evidence (run_id, task_id, profile, "
+                "program_role, policy_digest, root_id, evidence_generation, admitted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id, task_id, trow["assignee"], trow["program_role"],
+                    trow["orchestration_policy_digest"], trow["orchestration_root_id"],
+                    trow["evidence_generation"], now,
+                ),
+            )
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
@@ -5646,7 +6254,10 @@ def claim_review_task(
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "program_role, orchestration_policy_digest, orchestration_root_id, "
+            "COALESCE((SELECT evidence_generation FROM program_lifecycle "
+            "WHERE root_id=tasks.orchestration_root_id), 0) AS evidence_generation "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5655,8 +6266,9 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
+                program_role, orchestration_policy_digest, evidence_generation,
                 started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5665,10 +6277,24 @@ def claim_review_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                trow["program_role"] if trow else None,
+                trow["orchestration_policy_digest"] if trow else None,
+                trow["evidence_generation"] if trow else None,
                 now,
             ),
         )
         run_id = run_cur.lastrowid
+        if trow is not None and trow["program_role"] is not None:
+            conn.execute(
+                "INSERT INTO program_run_admission_evidence (run_id, task_id, profile, "
+                "program_role, policy_digest, root_id, evidence_generation, admitted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id, task_id, trow["assignee"], trow["program_role"],
+                    trow["orchestration_policy_digest"], trow["orchestration_root_id"],
+                    trow["evidence_generation"], now,
+                ),
+            )
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
