@@ -74,6 +74,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import random
@@ -84,8 +85,9 @@ import subprocess
 import sys
 import tempfile
 import threading
-import logging
 import time
+import unicodedata
+import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1284,6 +1286,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     result               TEXT,
     idempotency_key      TEXT,
     program_create_fingerprint TEXT,
+    program_control_version INTEGER NOT NULL DEFAULT 0,
     orchestration_policy TEXT,
     orchestration_root_id TEXT,
     orchestration_depth  INTEGER,
@@ -1497,6 +1500,49 @@ CREATE TABLE IF NOT EXISTS program_change_request_events (
     UNIQUE (request_id, event_type)
 );
 
+CREATE TABLE IF NOT EXISTS program_operator_hints (
+    hint_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, node_id TEXT NOT NULL,
+    text TEXT NOT NULL, expected_version INTEGER NOT NULL,
+    resulting_version INTEGER NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+    request_fingerprint TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS program_decisions (
+    root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, node_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'selected', 'superseded')),
+    version INTEGER NOT NULL CHECK (version >= 1), recommended_option_id TEXT NOT NULL,
+    selected_option_id TEXT, created_at INTEGER NOT NULL,
+    PRIMARY KEY (root_id, checkpoint_id)
+);
+CREATE TABLE IF NOT EXISTS program_decision_options (
+    root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, option_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL, PRIMARY KEY (root_id, checkpoint_id, option_id)
+);
+CREATE TABLE IF NOT EXISTS program_decision_public_briefs (
+    root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, schema_version INTEGER NOT NULL,
+    classification TEXT NOT NULL, title TEXT NOT NULL, recommendation_rationale TEXT NOT NULL,
+    recommended_option_id TEXT NOT NULL, content_digest TEXT NOT NULL,
+    generated_at INTEGER NOT NULL, created_at INTEGER NOT NULL,
+    PRIMARY KEY (root_id, checkpoint_id)
+);
+CREATE TABLE IF NOT EXISTS program_decision_public_options (
+    root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, option_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL, label TEXT NOT NULL, summary TEXT NOT NULL,
+    benefits TEXT NOT NULL, risks TEXT NOT NULL, reversibility TEXT NOT NULL,
+    security_impact TEXT NOT NULL, cost_impact TEXT NOT NULL, operations_impact TEXT NOT NULL,
+    PRIMARY KEY (root_id, checkpoint_id, option_id)
+);
+CREATE TABLE IF NOT EXISTS program_decision_affected_nodes (
+    root_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL, node_id TEXT NOT NULL,
+    PRIMARY KEY (root_id, checkpoint_id, node_id)
+);
+CREATE TABLE IF NOT EXISTS program_decision_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, root_id TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL, option_id TEXT NOT NULL, actor TEXT NOT NULL,
+    expected_version INTEGER NOT NULL, resulting_version INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE, request_fingerprint TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1522,6 +1568,18 @@ BEGIN SELECT RAISE(ABORT, 'program change audit is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_program_change_request_events_no_delete
 BEFORE DELETE ON program_change_request_events
 BEGIN SELECT RAISE(ABORT, 'program change audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_operator_hints_no_update
+BEFORE UPDATE ON program_operator_hints
+BEGIN SELECT RAISE(ABORT, 'program hint audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_operator_hints_no_delete
+BEFORE DELETE ON program_operator_hints
+BEGIN SELECT RAISE(ABORT, 'program hint audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_decision_events_no_update
+BEFORE UPDATE ON program_decision_events
+BEGIN SELECT RAISE(ABORT, 'program decision audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_decision_events_no_delete
+BEFORE DELETE ON program_decision_events
+BEGIN SELECT RAISE(ABORT, 'program decision audit is append-only'); END;
 """
 
 
@@ -1532,6 +1590,13 @@ _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS = frozenset(
         "idx_program_lifecycle_events_root",
         "program_change_requests",
         "program_change_request_events",
+        "program_operator_hints",
+        "program_decisions",
+        "program_decision_options",
+        "program_decision_public_briefs",
+        "program_decision_public_options",
+        "program_decision_affected_nodes",
+        "program_decision_events",
     }
 )
 _PROGRAM_SCHEMA_TRIGGER_OBJECTS = frozenset(
@@ -1540,6 +1605,10 @@ _PROGRAM_SCHEMA_TRIGGER_OBJECTS = frozenset(
         "trg_program_lifecycle_events_no_delete",
         "trg_program_change_request_events_no_update",
         "trg_program_change_request_events_no_delete",
+        "trg_program_operator_hints_no_update",
+        "trg_program_operator_hints_no_delete",
+        "trg_program_decision_events_no_update",
+        "trg_program_decision_events_no_delete",
     }
 )
 _PROGRAM_SCHEMA_OBJECTS = (
@@ -1550,6 +1619,23 @@ _PROGRAM_SCHEMA_PREDECESSOR_OBJECTS = frozenset(
         "program_lifecycle",
         "program_lifecycle_events",
         "idx_program_lifecycle_events_root",
+    }
+)
+_PROGRAM_SCHEMA_PHASE1_OBJECTS = frozenset(
+    {
+        "program_lifecycle",
+        "program_lifecycle_events",
+        "idx_program_lifecycle_events_root",
+        "program_change_requests",
+        "program_change_request_events",
+    }
+)
+_PROGRAM_SCHEMA_PHASE1_TRIGGERS = frozenset(
+    {
+        "trg_program_lifecycle_events_no_update",
+        "trg_program_lifecycle_events_no_delete",
+        "trg_program_change_request_events_no_update",
+        "trg_program_change_request_events_no_delete",
     }
 )
 _PROGRAM_SCHEMA_SIGNATURES: Optional[dict[str, tuple[str, str, str]]] = None
@@ -1598,7 +1684,8 @@ def _preflight_program_schema(path: Path) -> None:
                 rows = probe.execute(
                     "SELECT type, name, sql FROM sqlite_master WHERE name IN ("
                     + ",".join("?" for _ in _PROGRAM_SCHEMA_OBJECTS)
-                    + ")",
+                    + ") OR name GLOB 'program_*' OR name GLOB 'idx_program_*' "
+                    + "OR name GLOB 'trg_program_*'",
                     tuple(sorted(_PROGRAM_SCHEMA_OBJECTS)),
                 ).fetchall()
             except sqlite3.DatabaseError:
@@ -1615,6 +1702,8 @@ def _preflight_program_schema(path: Path) -> None:
     if names not in {
         frozenset(),
         _PROGRAM_SCHEMA_PREDECESSOR_OBJECTS,
+        _PROGRAM_SCHEMA_PHASE1_OBJECTS,
+        _PROGRAM_SCHEMA_PHASE1_OBJECTS | _PROGRAM_SCHEMA_PHASE1_TRIGGERS,
         _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS,
         _PROGRAM_SCHEMA_OBJECTS,
     }:
@@ -2225,6 +2314,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "program_create_fingerprint",
             "program_create_fingerprint TEXT",
+        )
+    if "program_control_version" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "program_control_version",
+            "program_control_version INTEGER NOT NULL DEFAULT 0",
         )
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
@@ -4178,12 +4274,400 @@ def _bounded_program_text(
     if not isinstance(value, str):
         raise ValueError(f"{field} must be text")
     cleaned = value.strip()
-    if (required and not cleaned) or len(cleaned) > maximum:
+    if (
+        (required and not cleaned)
+        or _javascript_string_length(cleaned) > maximum
+        or cleaned != unicodedata.normalize("NFC", cleaned)
+    ):
         qualifier = f"1 to {maximum}" if required else f"at most {maximum}"
-        raise ValueError(f"{field} must contain {qualifier} clean characters")
+        raise ValueError(f"{field} must contain {qualifier} canonical characters")
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
         raise ValueError(f"{field} must contain clean text")
     return cleaned
+
+
+def _program_wire_id(value: Any, field: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(
+        r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,199}", value
+    ) is None:
+        raise ValueError(f"{field} has invalid shape")
+    return value
+
+
+def _program_idempotency_key(value: Any) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value) is None:
+        raise ValueError("idempotency_key has invalid shape")
+    return value
+
+
+def _javascript_string_length(value: str) -> int:
+    """Match Zod/JavaScript string bounds (UTF-16 code units)."""
+    return len(value.encode("utf-16-le")) // 2
+
+
+def validate_program_control_request(
+    action: str, request: Any, *, decision_action: Optional[str] = None
+) -> dict[str, Any]:
+    """Validate the exact Mission Control stdin shape without touching SQLite."""
+    if not isinstance(request, dict):
+        raise ValueError("program control request must be an object")
+    if action == "hint":
+        required = {
+            "program_id", "node_id", "text", "expected_node_version", "idempotency_key"
+        }
+        if set(request) != required:
+            raise ValueError("hint request has unknown or missing fields")
+        _program_wire_id(request["program_id"], "program_id")
+        _program_wire_id(request["node_id"], "node_id")
+        text = request["text"]
+        if not isinstance(text, str) or not text or _javascript_string_length(text) > 2000:
+            raise ValueError("text must contain 1 to 2000 characters")
+        version = request["expected_node_version"]
+        if type(version) is not int or version < 0:
+            raise ValueError("expected_node_version must be a nonnegative integer")
+        _program_idempotency_key(request["idempotency_key"])
+    elif action == "decision" and decision_action == "select":
+        required = {
+            "root_id", "checkpoint_id", "option_id", "expected_version",
+            "idempotency_key", "actor",
+        }
+        if set(request) != required:
+            raise ValueError("decision request has unknown or missing fields")
+        for field in ("root_id", "checkpoint_id", "option_id"):
+            _program_wire_id(request[field], field)
+        version = request["expected_version"]
+        if type(version) is not int or version < 0:
+            raise ValueError("expected_version must be a nonnegative integer")
+        _program_idempotency_key(request["idempotency_key"])
+        if request["actor"] != "control:owner":
+            raise ValueError("actor must be control:owner")
+    else:
+        raise ValueError("unsupported program control request")
+    return request
+
+
+def _program_node_is_bound(conn: sqlite3.Connection, root_id: str, node_id: str) -> bool:
+    row = conn.execute(
+        "SELECT orchestration_root_id, orchestration_depth, orchestration_policy "
+        "FROM tasks WHERE id = ?", (node_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    return row["orchestration_root_id"] == root_id and (
+        node_id != root_id or (row["orchestration_depth"] == 0 and row["orchestration_policy"])
+    )
+
+
+def _assert_program_hint_history(
+    conn: sqlite3.Connection, root_id: str, node_id: str
+) -> int:
+    node = conn.execute(
+        "SELECT program_control_version AS version FROM tasks WHERE id = ? "
+        "AND orchestration_root_id = ?",
+        (node_id, root_id),
+    ).fetchone()
+    events = conn.execute(
+        "SELECT root_id,node_id,expected_version,resulting_version "
+        "FROM program_operator_hints WHERE root_id=? AND node_id=? "
+        "ORDER BY expected_version,resulting_version,hint_id LIMIT 10001",
+        (root_id, node_id),
+    ).fetchall()
+    if node is None or len(events) > 10_000:
+        raise ValueError("program hint history integrity check failed")
+    for expected, event in enumerate(events):
+        if (
+            event["root_id"] != root_id
+            or event["node_id"] != node_id
+            or event["expected_version"] != expected
+            or event["resulting_version"] != expected + 1
+        ):
+            raise ValueError("program hint history integrity check failed")
+    if node["version"] != len(events):
+        raise ValueError("program hint history integrity check failed")
+    return node["version"]
+
+
+def record_program_operator_hint(
+    conn: sqlite3.Connection, request: dict[str, Any]
+) -> dict[str, Any]:
+    if not is_mission_control_command_cgroup():
+        raise ValueError("operator hints require trusted Mission Control")
+    validate_program_control_request("hint", request)
+    root_id, node_id = request["program_id"], request["node_id"]
+    expected, key = request["expected_node_version"], request["idempotency_key"]
+    _, fingerprint = _sha256_json({"version": 1, **request})
+    hint_id = "hint-" + fingerprint.removeprefix("sha256:")[:32]
+    now = int(time.time())
+    with write_txn(conn):
+        _program_root_row(conn, root_id)
+        if not _program_node_is_bound(conn, root_id, node_id):
+            raise ValueError("node is not bound to program root")
+        current_version = _assert_program_hint_history(conn, root_id, node_id)
+        existing = conn.execute(
+            "SELECT * FROM program_operator_hints WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        if existing is not None:
+            if existing["request_fingerprint"] != fingerprint:
+                raise ValueError("idempotency key request does not match")
+            return {
+                "ok": True, "hint_id": existing["hint_id"], "node_id": existing["node_id"],
+                "state": "recorded", "node_version": existing["resulting_version"],
+                "deduplicated": True,
+            }
+        if current_version >= 10_000:
+            raise ValueError("program hint history capacity reached")
+        if current_version != expected:
+            raise ValueError("stale node version")
+        resulting = expected + 1
+        updated = conn.execute(
+            "UPDATE tasks SET program_control_version = ? WHERE id = ? "
+            "AND orchestration_root_id = ? AND program_control_version = ?",
+            (resulting, node_id, root_id, expected),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("stale node version")
+        conn.execute(
+            "INSERT INTO program_operator_hints (hint_id, root_id, node_id, text, "
+            "expected_version, resulting_version, idempotency_key, request_fingerprint, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (hint_id, root_id, node_id, request["text"], expected, resulting, key, fingerprint, now),
+        )
+    return {
+        "ok": True, "hint_id": hint_id, "node_id": node_id, "state": "recorded",
+        "node_version": resulting, "deduplicated": False,
+    }
+
+
+def create_program_decision_checkpoint(
+    conn: sqlite3.Connection,
+    root_id: str,
+    checkpoint_id: str,
+    *,
+    node_id: str,
+    recommended_option_id: str,
+    title: str,
+    recommendation_rationale: str,
+    options: Iterable[dict[str, Any]],
+    affected_node_ids: Iterable[str] = (),
+) -> None:
+    """Create one projection-compatible operator-visible decision checkpoint."""
+    if not is_mission_control_command_cgroup():
+        raise ValueError("decision checkpoints require trusted Mission Control")
+    root_id = _program_wire_id(root_id, "root_id")
+    checkpoint_id = _program_wire_id(checkpoint_id, "checkpoint_id")
+    node_id = _program_wire_id(node_id, "node_id")
+    recommended_option_id = _program_wire_id(recommended_option_id, "recommended_option_id")
+    title = _bounded_program_text(title, "title", maximum=200) or ""
+    rationale = _bounded_program_text(
+        recommendation_rationale, "recommendation_rationale", maximum=1000
+    ) or ""
+    option_rows = tuple(options)
+    required = {
+        "option_id", "label", "summary", "benefits", "risks", "reversibility",
+        "security_impact", "cost_impact", "operations_impact",
+    }
+    if not 2 <= len(option_rows) <= 4 or any(set(option) != required for option in option_rows):
+        raise ValueError("options must contain 2 to 4 exact public option objects")
+    canonical_options = []
+    for ordinal, option in enumerate(option_rows):
+        option_id = _program_wire_id(option["option_id"], "option_id")
+        benefits, risks = option["benefits"], option["risks"]
+        if (
+            not isinstance(benefits, list)
+            or not isinstance(risks, list)
+            or not 1 <= len(benefits) <= 10
+            or not 1 <= len(risks) <= 10
+            or option["reversibility"] not in {
+                "reversible", "partially_reversible", "irreversible"
+            }
+        ):
+            raise ValueError("option public brief has invalid structured values")
+        canonical_benefits = [
+            _bounded_program_text(value, "benefit", maximum=500) for value in benefits
+        ]
+        canonical_risks = [
+            _bounded_program_text(value, "risk", maximum=500) for value in risks
+        ]
+        if (
+            len(set(canonical_benefits)) != len(canonical_benefits)
+            or len(set(canonical_risks)) != len(canonical_risks)
+        ):
+            raise ValueError("option public lists must contain unique canonical values")
+        canonical_options.append({
+            "option_id": option_id,
+            "ordinal": ordinal,
+            "label": _bounded_program_text(option["label"], "label", maximum=200),
+            "summary": _bounded_program_text(option["summary"], "summary", maximum=1000),
+            "benefits": canonical_benefits,
+            "risks": canonical_risks,
+            "reversibility": option["reversibility"],
+            "security_impact": _bounded_program_text(
+                option["security_impact"], "security_impact", maximum=1000
+            ),
+            "cost_impact": _bounded_program_text(option["cost_impact"], "cost_impact", maximum=1000),
+            "operations_impact": _bounded_program_text(
+                option["operations_impact"], "operations_impact", maximum=1000
+            ),
+        })
+    option_ids = [option["option_id"] for option in canonical_options]
+    if len(set(option_ids)) != len(option_ids) or recommended_option_id not in option_ids:
+        raise ValueError("recommended option must be one unique checkpoint option")
+    affected = tuple(_program_wire_id(value, "affected_node_id") for value in affected_node_ids)
+    if not affected:
+        affected = (node_id,)
+    if len(affected) > 100 or len(set(affected)) != len(affected):
+        raise ValueError("affected nodes must contain 1 to 100 unique node identifiers")
+    canonical_brief = {
+        "kind": "hermes_program_decision_public_brief",
+        "schema_version": 1,
+        "scanner_policy_version": 1,
+        "classification": "operator_visible",
+        "title": title,
+        "recommendation_rationale": rationale,
+        "recommended_option_id": recommended_option_id,
+        "options": canonical_options,
+    }
+    canonical_bytes = json.dumps(
+        canonical_brief, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    content_digest = hashlib.sha256(canonical_bytes).hexdigest()
+    now = int(time.time())
+    with write_txn(conn):
+        _program_root_row(conn, root_id)
+        if not _program_node_is_bound(conn, root_id, node_id) or any(
+            not _program_node_is_bound(conn, root_id, value) for value in affected
+        ):
+            raise ValueError("decision node is not bound to program root")
+        conn.execute(
+            "INSERT INTO program_decisions (root_id, checkpoint_id, node_id, state, version, "
+            "recommended_option_id, selected_option_id, created_at) "
+            "VALUES (?, ?, ?, 'pending', 1, ?, NULL, ?)",
+            (root_id, checkpoint_id, node_id, recommended_option_id, now),
+        )
+        for option in canonical_options:
+            conn.execute(
+                "INSERT INTO program_decision_options VALUES (?, ?, ?, ?)",
+                (root_id, checkpoint_id, option["option_id"], option["ordinal"]),
+            )
+            conn.execute(
+                "INSERT INTO program_decision_public_options VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    root_id, checkpoint_id, option["option_id"], option["ordinal"],
+                    option["label"], option["summary"],
+                    json.dumps(option["benefits"], separators=(",", ":"), ensure_ascii=False),
+                    json.dumps(option["risks"], separators=(",", ":"), ensure_ascii=False),
+                    option["reversibility"], option["security_impact"], option["cost_impact"],
+                    option["operations_impact"],
+                ),
+            )
+        conn.execute(
+            "INSERT INTO program_decision_public_briefs VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (root_id, checkpoint_id, 1, "operator_visible", title, rationale,
+             recommended_option_id, content_digest, now, now),
+        )
+        conn.executemany(
+            "INSERT INTO program_decision_affected_nodes VALUES (?, ?, ?)",
+            ((root_id, checkpoint_id, value) for value in affected),
+        )
+
+
+def _assert_program_decision_history(
+    conn: sqlite3.Connection, checkpoint: sqlite3.Row
+) -> None:
+    root_id, checkpoint_id = checkpoint["root_id"], checkpoint["checkpoint_id"]
+    events = conn.execute(
+        "SELECT root_id,checkpoint_id,option_id,actor,expected_version,resulting_version "
+        "FROM program_decision_events WHERE root_id=? AND checkpoint_id=? ORDER BY id LIMIT 2",
+        (root_id, checkpoint_id),
+    ).fetchall()
+    if len(events) == 0:
+        valid = (
+            checkpoint["state"] == "pending"
+            and checkpoint["version"] == 1
+            and checkpoint["selected_option_id"] is None
+        )
+    elif len(events) == 1:
+        event = events[0]
+        option_bound = conn.execute(
+            "SELECT 1 FROM program_decision_options WHERE root_id=? AND checkpoint_id=? "
+            "AND option_id=?",
+            (root_id, checkpoint_id, event["option_id"]),
+        ).fetchone() is not None
+        valid = (
+            option_bound
+            and event["root_id"] == root_id
+            and event["checkpoint_id"] == checkpoint_id
+            and event["actor"] == "control:owner"
+            and event["expected_version"] == 1
+            and event["resulting_version"] == 2
+            and checkpoint["state"] == "selected"
+            and checkpoint["version"] == 2
+            and checkpoint["selected_option_id"] == event["option_id"]
+        )
+    else:
+        valid = False
+    if not valid:
+        raise ValueError("program decision history integrity check failed")
+
+
+def select_program_decision(
+    conn: sqlite3.Connection, request: dict[str, Any]
+) -> dict[str, Any]:
+    if not is_mission_control_command_cgroup():
+        raise ValueError("decision selection requires trusted Mission Control")
+    validate_program_control_request("decision", request, decision_action="select")
+    root_id, checkpoint_id = request["root_id"], request["checkpoint_id"]
+    option_id, expected = request["option_id"], request["expected_version"]
+    key, actor = request["idempotency_key"], request["actor"]
+    _, fingerprint = _sha256_json({"version": 1, **request})
+    now = int(time.time())
+    with write_txn(conn):
+        _program_root_row(conn, root_id)
+        checkpoint = conn.execute(
+            "SELECT * FROM program_decisions WHERE root_id = ? AND checkpoint_id = ?",
+            (root_id, checkpoint_id),
+        ).fetchone()
+        if checkpoint is None or checkpoint["root_id"] != root_id:
+            raise ValueError("unknown or root-mismatched decision checkpoint")
+        _assert_program_decision_history(conn, checkpoint)
+        existing = conn.execute(
+            "SELECT * FROM program_decision_events WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        if existing is not None:
+            if existing["request_fingerprint"] != fingerprint:
+                raise ValueError("idempotency key request does not match")
+            return {
+                "ok": True, "checkpoint_id": existing["checkpoint_id"],
+                "state": "selected", "version": existing["resulting_version"],
+                "selected_option_id": existing["option_id"], "deduplicated": True,
+            }
+        if conn.execute(
+            "SELECT 1 FROM program_decision_options WHERE root_id = ? "
+            "AND checkpoint_id = ? AND option_id = ?",
+            (root_id, checkpoint_id, option_id),
+        ).fetchone() is None:
+            raise ValueError("option is not a member of checkpoint")
+        if checkpoint["state"] != "pending" or checkpoint["version"] != expected:
+            raise ValueError("stale decision version")
+        resulting = expected + 1
+        updated = conn.execute(
+            "UPDATE program_decisions SET state = 'selected', version = ?, "
+            "selected_option_id = ? WHERE checkpoint_id = ? "
+            "AND root_id = ? AND state = 'pending' AND version = ?",
+            (resulting, option_id, checkpoint_id, root_id, expected),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("stale decision version")
+        conn.execute(
+            "INSERT INTO program_decision_events (root_id, checkpoint_id, option_id, actor, "
+            "expected_version, resulting_version, idempotency_key, request_fingerprint, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (root_id, checkpoint_id, option_id, actor, expected, resulting, key, fingerprint, now),
+        )
+    return {
+        "ok": True, "checkpoint_id": checkpoint_id, "state": "selected",
+        "version": resulting, "selected_option_id": option_id, "deduplicated": False,
+    }
 
 
 def _canonical_program_change(change: Any) -> tuple[dict[str, Any], str, str]:

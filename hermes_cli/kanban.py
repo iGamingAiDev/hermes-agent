@@ -441,6 +441,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_program_create.add_argument("--idempotency-key", default=None)
     p_program_create.add_argument("--json", action="store_true")
 
+    p_program_capabilities = program_sub.add_parser(
+        "capabilities", help="Report the exact trusted program-control contract"
+    )
+    p_program_capabilities.add_argument("--json", action="store_true", required=True)
+
+    p_program_hint = program_sub.add_parser("hint", help="Record an operator hint")
+    p_program_hint.add_argument("--request-json-stdin", action="store_true", required=True)
+    p_program_hint.add_argument("--json", action="store_true", required=True)
+
+    p_program_decision = program_sub.add_parser("decision", help="Control a decision checkpoint")
+    decision_sub = p_program_decision.add_subparsers(dest="decision_action", required=True)
+    p_decision_select = decision_sub.add_parser("select", help="Select one checkpoint option")
+    p_decision_select.add_argument("--request-json-stdin", action="store_true", required=True)
+    p_decision_select.add_argument("--json", action="store_true", required=True)
+
     def _program_mutation_args(parser, *, request_id=False):
         parser.add_argument("root_id")
         if request_id:
@@ -994,6 +1009,18 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "program" and not kb.is_mission_control_command_cgroup():
         return _reject_program_command()
 
+    if action == "program" and getattr(args, "program_action", None) in {"hint", "decision"}:
+        try:
+            args._program_control_request = _read_strict_json_object()
+            kb.validate_program_control_request(
+                args.program_action,
+                args._program_control_request,
+                decision_action=getattr(args, "decision_action", None),
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"kanban program: {exc}", file=sys.stderr)
+            return 2
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1037,6 +1064,8 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
+        if action == "program" and getattr(args, "program_action", None) == "capabilities":
+            return _cmd_program_capabilities(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -1492,6 +1521,10 @@ def _cmd_program_create(args: argparse.Namespace) -> int:
     action = args.program_action
     if action == "create":
         return _cmd_program_create_root(args)
+    if action == "hint":
+        return _cmd_program_hint(args)
+    if action == "decision" and args.decision_action == "select":
+        return _cmd_program_decision_select(args)
     try:
         change = None
         if action == "change" and args.change_action == "prepare":
@@ -1539,6 +1572,47 @@ def _cmd_program_create(args: argparse.Namespace) -> int:
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     else:
         print(f"Program {action} completed for {result['root_id']}")
+    return 0
+
+
+def _cmd_program_capabilities(args: argparse.Namespace) -> int:
+    board = getattr(args, "board", None) or kb.get_current_board()
+    payload = {
+        "contract": "hermes-program-control",
+        "board": board,
+        "version": 2,
+        "schema": 2,
+        "operator_visible_decision_briefs": 1,
+        "cli": 1,
+        "dispatcher_gate": 1,
+        "classic_worker_boundary": 1,
+        "goal_loop_boundary": 1,
+        "ack_writer": 1,
+        "events": 1,
+    }
+    print(json.dumps(payload, separators=(",", ":")))
+    return 0
+
+
+def _cmd_program_hint(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            result = kb.record_program_operator_hint(conn, args._program_control_request)
+    except ValueError as exc:
+        print(f"kanban program hint: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def _cmd_program_decision_select(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            result = kb.select_program_decision(conn, args._program_control_request)
+    except ValueError as exc:
+        print(f"kanban program decision select: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, separators=(",", ":")))
     return 0
 
 
