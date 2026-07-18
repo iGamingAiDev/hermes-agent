@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -81,6 +82,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -123,6 +125,10 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+
+# Trusted Mission Control may extend a deadline, but never beyond this hard
+# lifetime from the immutable root creation instant.
+PROGRAM_MAX_TOTAL_WALL_CLOCK_SECONDS = 30 * 24 * 60 * 60
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1429,6 +1435,68 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable lifecycle overlay for immutable orchestration roots. Policy JSON on
+-- tasks remains immutable; every mutable lifecycle transition is audited.
+CREATE TABLE IF NOT EXISTS program_lifecycle (
+    root_id             TEXT PRIMARY KEY,
+    root_fingerprint    TEXT NOT NULL,
+    initial_deadline    INTEGER NOT NULL,
+    effective_deadline  INTEGER NOT NULL,
+    archived_at         INTEGER,
+    archive_actor       TEXT,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS program_lifecycle_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id             TEXT NOT NULL,
+    operation           TEXT NOT NULL,
+    actor               TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    previous_deadline   INTEGER,
+    new_deadline        INTEGER,
+    result_json         TEXT,
+    created_at          INTEGER NOT NULL,
+    UNIQUE (root_id, actor, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS program_change_requests (
+    request_id          TEXT PRIMARY KEY,
+    root_id             TEXT NOT NULL,
+    root_fingerprint    TEXT NOT NULL,
+    operation           TEXT NOT NULL CHECK (operation IN ('extend_deadline', 'archive')),
+    change_json         TEXT NOT NULL,
+    request_digest      TEXT NOT NULL,
+    prepared_state_digest TEXT NOT NULL,
+    prepare_actor       TEXT NOT NULL,
+    prepare_idempotency_key TEXT NOT NULL,
+    prepare_fingerprint TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('prepared', 'applied')),
+    apply_actor         TEXT,
+    apply_idempotency_key TEXT,
+    apply_fingerprint   TEXT,
+    result_json         TEXT,
+    prepared_at         INTEGER NOT NULL,
+    applied_at          INTEGER,
+    UNIQUE (root_id, prepare_actor, prepare_idempotency_key),
+    UNIQUE (root_id, apply_actor, apply_idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS program_change_request_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id          TEXT NOT NULL,
+    root_id             TEXT NOT NULL,
+    event_type          TEXT NOT NULL CHECK (event_type IN ('prepared', 'applied')),
+    actor               TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL,
+    event_fingerprint   TEXT NOT NULL,
+    payload_json        TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    UNIQUE (request_id, event_type)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1439,7 +1507,121 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_program_lifecycle_events_root
+    ON program_lifecycle_events(root_id, id);
+
+CREATE TRIGGER IF NOT EXISTS trg_program_lifecycle_events_no_update
+BEFORE UPDATE ON program_lifecycle_events
+BEGIN SELECT RAISE(ABORT, 'program lifecycle audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_lifecycle_events_no_delete
+BEFORE DELETE ON program_lifecycle_events
+BEGIN SELECT RAISE(ABORT, 'program lifecycle audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_change_request_events_no_update
+BEFORE UPDATE ON program_change_request_events
+BEGIN SELECT RAISE(ABORT, 'program change audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_program_change_request_events_no_delete
+BEFORE DELETE ON program_change_request_events
+BEGIN SELECT RAISE(ABORT, 'program change audit is append-only'); END;
 """
+
+
+_PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS = frozenset(
+    {
+        "program_lifecycle",
+        "program_lifecycle_events",
+        "idx_program_lifecycle_events_root",
+        "program_change_requests",
+        "program_change_request_events",
+    }
+)
+_PROGRAM_SCHEMA_TRIGGER_OBJECTS = frozenset(
+    {
+        "trg_program_lifecycle_events_no_update",
+        "trg_program_lifecycle_events_no_delete",
+        "trg_program_change_request_events_no_update",
+        "trg_program_change_request_events_no_delete",
+    }
+)
+_PROGRAM_SCHEMA_OBJECTS = (
+    _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS | _PROGRAM_SCHEMA_TRIGGER_OBJECTS
+)
+_PROGRAM_SCHEMA_PREDECESSOR_OBJECTS = frozenset(
+    {
+        "program_lifecycle",
+        "program_lifecycle_events",
+        "idx_program_lifecycle_events_root",
+    }
+)
+_PROGRAM_SCHEMA_SIGNATURES: Optional[dict[str, tuple[str, str, str]]] = None
+
+
+def _normalize_schema_sql(sql: Optional[str]) -> str:
+    return " ".join((sql or "").split()).casefold()
+
+
+def _canonical_program_schema_signatures() -> dict[str, tuple[str, str, str]]:
+    global _PROGRAM_SCHEMA_SIGNATURES
+    if _PROGRAM_SCHEMA_SIGNATURES is None:
+        canonical = sqlite3.connect(":memory:")
+        try:
+            canonical.executescript(SCHEMA_SQL)
+            rows = canonical.execute(
+                "SELECT type, name, sql FROM sqlite_master WHERE name IN ("
+                + ",".join("?" for _ in _PROGRAM_SCHEMA_OBJECTS)
+                + ")",
+                tuple(sorted(_PROGRAM_SCHEMA_OBJECTS)),
+            ).fetchall()
+        finally:
+            canonical.close()
+        _PROGRAM_SCHEMA_SIGNATURES = {
+            row[1]: (row[0], row[1], _normalize_schema_sql(row[2])) for row in rows
+        }
+    return _PROGRAM_SCHEMA_SIGNATURES
+
+
+def _preflight_program_schema(path: Path) -> None:
+    """Reject reserved lifecycle near-shapes before opening the DB for writes."""
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return
+    except OSError:
+        return
+    with tempfile.TemporaryDirectory(prefix="hermes-kanban-preflight-") as temp_dir:
+        snapshot = Path(temp_dir) / path.name
+        shutil.copy2(path, snapshot)
+        wal = path.with_name(path.name + "-wal")
+        if wal.exists():
+            shutil.copy2(wal, snapshot.with_name(snapshot.name + "-wal"))
+        probe = sqlite3.connect(snapshot)
+        try:
+            try:
+                rows = probe.execute(
+                    "SELECT type, name, sql FROM sqlite_master WHERE name IN ("
+                    + ",".join("?" for _ in _PROGRAM_SCHEMA_OBJECTS)
+                    + ")",
+                    tuple(sorted(_PROGRAM_SCHEMA_OBJECTS)),
+                ).fetchall()
+            except sqlite3.DatabaseError:
+                # This preflight classifies only readable lifecycle schemas.
+                # Preserve the existing corruption/quarantine path as the
+                # single authority for malformed SQLite files.
+                return
+        finally:
+            probe.close()
+    actual = {
+        row[1]: (row[0], row[1], _normalize_schema_sql(row[2])) for row in rows
+    }
+    names = frozenset(actual)
+    if names not in {
+        frozenset(),
+        _PROGRAM_SCHEMA_PREDECESSOR_OBJECTS,
+        _PROGRAM_SCHEMA_CURRENT_TABLE_OBJECTS,
+        _PROGRAM_SCHEMA_OBJECTS,
+    }:
+        raise ValueError("unsupported program lifecycle schema")
+    canonical = _canonical_program_schema_signatures()
+    if any(actual[name] != canonical[name] for name in names):
+        raise ValueError("unsupported program lifecycle schema")
 
 
 # ---------------------------------------------------------------------------
@@ -1905,6 +2087,10 @@ def connect(
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
         _validate_sqlite_header(path)
+        # Reserved lifecycle names are security-sensitive. Accept only the exact
+        # canonical schema or an explicitly supported exact predecessor before
+        # any writable open can make a malformed near-shape authoritative.
+        _preflight_program_schema(path)
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
@@ -2837,6 +3023,8 @@ def create_task(
                     else:
                         policy = authority.orchestration_policy
                 if current_orchestrator_task_id is not None and authority is not None:
+                    if policy is None:
+                        raise ValueError("malformed orchestration authority")
                     if (
                         not isinstance(creation_authority, CreationAuthority)
                         or type(creation_authority.run_id) is not int
@@ -3010,19 +3198,32 @@ def create_task(
                         return existing["id"]
 
                 if policy is not None:
-                    root_created_at = conn.execute(
-                        "SELECT created_at FROM tasks WHERE id = ?",
-                        (orchestration_root_id,),
-                    ).fetchone()
-                    # A new root has no row yet, so its immutable creation
-                    # instant is the boundary's own ``now`` value.
-                    created_at = (
-                        int(root_created_at["created_at"])
-                        if root_created_at is not None else now
-                    )
+                    if orchestration_depth == 0:
+                        # A new root has no durable lifecycle row yet.
+                        deadline = now + policy.max_wall_clock_seconds
+                    else:
+                        # Child admission is governed by the durable lifecycle
+                        # overlay under the same write transaction as insertion.
+                        if not orchestration_root_id:
+                            raise ValueError("malformed orchestration authority")
+                        root = _program_root_row(conn, orchestration_root_id)
+                        root_policy = OrchestrationPolicy.from_json(
+                            root["orchestration_policy"]
+                        )
+                        if root_policy != policy:
+                            raise ValueError("orchestration program authority mismatch")
+                        lifecycle = _ensure_program_lifecycle(
+                            conn, root, root_policy, now
+                        )
+                        if (
+                            root["status"] == "archived"
+                            or lifecycle["archived_at"] is not None
+                        ):
+                            raise ValueError("orchestration program is archived")
+                        deadline = int(lifecycle["effective_deadline"])
                     # The expiry instant is closed throughout the lifecycle:
                     # no mutation or admission is allowed at ``now >= deadline``.
-                    if now >= created_at + policy.max_wall_clock_seconds:
+                    if now >= deadline:
                         raise ValueError("orchestration program deadline exceeded")
                     if (
                         orchestration_depth == 0
@@ -3896,6 +4097,830 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _bounded_program_identity(value: str, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be text")
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > 128 or any(ord(ch) < 32 for ch in cleaned):
+        raise ValueError(f"{field} must contain 1 to 128 clean characters")
+    return cleaned
+
+
+def _program_root_row(conn: sqlite3.Connection, root_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT id, status, created_at, created_by, assignee, project_id, tenant, "
+        "program_create_fingerprint, orchestration_policy, orchestration_root_id, "
+        "orchestration_depth, orchestration_parent_id "
+        "FROM tasks WHERE id = ?",
+        (root_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["orchestration_root_id"] != root_id
+        or row["orchestration_depth"] != 0
+        or not row["orchestration_policy"]
+    ):
+        raise ValueError("unknown or invalid orchestration program root")
+    return row
+
+
+def _ensure_program_lifecycle(
+    conn: sqlite3.Connection, root: sqlite3.Row, policy: OrchestrationPolicy, now: int
+) -> sqlite3.Row:
+    root_id = root["id"]
+    root_fingerprint = root["program_create_fingerprint"]
+    if not root_fingerprint:
+        document = json.dumps(
+            {
+                "version": 1,
+                "root_id": root_id,
+                "created_at": int(root["created_at"]),
+                "policy": json.loads(policy.to_json()),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        root_fingerprint = "legacy-v1:" + hashlib.sha256(document).hexdigest()
+    initial_deadline = int(root["created_at"]) + policy.max_wall_clock_seconds
+    conn.execute(
+        "INSERT OR IGNORE INTO program_lifecycle ("
+        "root_id, root_fingerprint, initial_deadline, effective_deadline, "
+        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            root_id,
+            root_fingerprint,
+            initial_deadline,
+            initial_deadline,
+            now,
+            now,
+        ),
+    )
+    lifecycle = conn.execute(
+        "SELECT * FROM program_lifecycle WHERE root_id = ?", (root_id,)
+    ).fetchone()
+    if lifecycle is None or lifecycle["root_fingerprint"] != root_fingerprint:
+        raise ValueError("program lifecycle root binding mismatch")
+    return lifecycle
+
+
+def _sha256_json(document: Any) -> tuple[str, str]:
+    encoded = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return encoded, "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _bounded_program_text(
+    value: Any, field: str, *, maximum: int, required: bool = True
+) -> Optional[str]:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be text")
+    cleaned = value.strip()
+    if (required and not cleaned) or len(cleaned) > maximum:
+        qualifier = f"1 to {maximum}" if required else f"at most {maximum}"
+        raise ValueError(f"{field} must contain {qualifier} clean characters")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        raise ValueError(f"{field} must contain clean text")
+    return cleaned
+
+
+def _canonical_program_change(change: Any) -> tuple[dict[str, Any], str, str]:
+    if not isinstance(change, dict):
+        raise ValueError("change request JSON must be an object")
+    operation = change.get("operation")
+    if operation == "extend_deadline":
+        allowed = {"operation", "new_deadline", "reason"}
+        if set(change) - allowed or set(change) < {"operation", "new_deadline"}:
+            raise ValueError("extend_deadline change has unknown or missing fields")
+        deadline = change["new_deadline"]
+        if type(deadline) is not int:
+            raise ValueError("new_deadline must be an integer timestamp")
+        canonical: dict[str, Any] = {
+            "operation": operation,
+            "new_deadline": deadline,
+        }
+    elif operation == "archive":
+        allowed = {"operation", "reason"}
+        if set(change) - allowed or "operation" not in change:
+            raise ValueError("archive change has unknown or missing fields")
+        canonical = {"operation": operation}
+    else:
+        raise ValueError("operation must be extend_deadline or archive")
+    if "reason" in change:
+        canonical["reason"] = _bounded_program_text(
+            change["reason"], "reason", maximum=2000
+        )
+    change_json, request_digest = _sha256_json(canonical)
+    return canonical, change_json, request_digest
+
+
+def _program_state_digest(
+    conn: sqlite3.Connection, root: sqlite3.Row, lifecycle: sqlite3.Row
+) -> str:
+    task_states = []
+    rows = conn.execute(
+        "SELECT id, status, created_at, assignee, project_id, tenant, "
+        "program_create_fingerprint, orchestration_policy, orchestration_root_id, "
+        "orchestration_depth, orchestration_parent_id "
+        "FROM tasks WHERE orchestration_root_id = ? ORDER BY id",
+        (root["id"],),
+    )
+    for row in rows:
+        task_policy = row["orchestration_policy"]
+        task_states.append(
+            {
+                "id": row["id"],
+                "status": row["status"],
+                "created_at": int(row["created_at"]),
+                "assignee": row["assignee"],
+                "project_id": row["project_id"],
+                "tenant": row["tenant"],
+                "program_create_fingerprint": row["program_create_fingerprint"],
+                "orchestration_policy": (
+                    json.loads(OrchestrationPolicy.from_json(task_policy).to_json())
+                    if task_policy is not None
+                    else None
+                ),
+                "orchestration_root_id": row["orchestration_root_id"],
+                "orchestration_depth": row["orchestration_depth"],
+                "orchestration_parent_id": row["orchestration_parent_id"],
+            }
+        )
+    _, digest = _sha256_json(
+        {
+            "version": 2,
+            "root": {
+                "id": root["id"],
+                "status": root["status"],
+                "created_at": int(root["created_at"]),
+                "created_by": root["created_by"],
+                "assignee": root["assignee"],
+                "project_id": root["project_id"],
+                "tenant": root["tenant"],
+                "program_create_fingerprint": root["program_create_fingerprint"],
+                "orchestration_policy": json.loads(
+                    OrchestrationPolicy.from_json(root["orchestration_policy"]).to_json()
+                ),
+                "orchestration_root_id": root["orchestration_root_id"],
+                "orchestration_depth": root["orchestration_depth"],
+                "orchestration_parent_id": root["orchestration_parent_id"],
+            },
+            "lifecycle": {
+                "root_fingerprint": lifecycle["root_fingerprint"],
+                "initial_deadline": int(lifecycle["initial_deadline"]),
+                "effective_deadline": int(lifecycle["effective_deadline"]),
+                "archived_at": lifecycle["archived_at"],
+                "archive_actor": lifecycle["archive_actor"],
+            },
+            "tasks": task_states,
+        }
+    )
+    return digest
+
+
+def _prepared_change_result(row: sqlite3.Row, *, replayed: bool) -> dict[str, Any]:
+    return {
+        "request_id": row["request_id"],
+        "root_id": row["root_id"],
+        "operation": row["operation"],
+        "status": row["status"],
+        "request_digest": row["request_digest"],
+        "actor": row["prepare_actor"],
+        "idempotency_key": row["prepare_idempotency_key"],
+        "replayed": replayed,
+    }
+
+
+def _verify_prepared_request_anchor(
+    conn: sqlite3.Connection, request: sqlite3.Row
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Authenticate the mutable request row against its append-only event chain."""
+    prepared_events = conn.execute(
+        "SELECT request_id, root_id, actor, idempotency_key, event_fingerprint, "
+        "payload_json, created_at FROM program_change_request_events "
+        "WHERE request_id = ? AND event_type = 'prepared'",
+        (request["request_id"],),
+    ).fetchall()
+    if len(prepared_events) != 1:
+        raise ValueError("program change request integrity check failed")
+    event = prepared_events[0]
+    change_json = request["change_json"]
+    if not isinstance(change_json, str):
+        raise ValueError("program change request integrity check failed")
+    try:
+        parsed_change = json.loads(change_json)
+        canonical_change, canonical_json, canonical_digest = _canonical_program_change(
+            parsed_change
+        )
+        payload = json.loads(event["payload_json"])
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("program change request integrity check failed") from exc
+    expected_result = {
+        "request_id": event["request_id"],
+        "root_id": event["root_id"],
+        "operation": canonical_change["operation"],
+        "status": "prepared",
+        "request_digest": canonical_digest,
+        "actor": event["actor"],
+        "idempotency_key": event["idempotency_key"],
+        "replayed": False,
+    }
+    if not isinstance(payload, dict):
+        raise ValueError("program change request integrity check failed")
+    sealed_root_fingerprint = payload.get("root_fingerprint")
+    sealed_state_digest = payload.get("prepared_state_digest")
+    expected_payload = {
+        "version": 2,
+        "request": expected_result,
+        "root_fingerprint": sealed_root_fingerprint,
+        "prepared_state_digest": sealed_state_digest,
+        "prepared_at": event["created_at"],
+    }
+    _, expected_prepare_fingerprint = _sha256_json(
+        {
+            "version": 1,
+            "root_id": event["root_id"],
+            "actor": event["actor"],
+            "idempotency_key": event["idempotency_key"],
+            "request_digest": canonical_digest,
+        }
+    )
+    if (
+        canonical_json != change_json
+        or payload != expected_payload
+        or not isinstance(sealed_root_fingerprint, str)
+        or re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", sealed_root_fingerprint) is None
+        or not isinstance(sealed_state_digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", sealed_state_digest) is None
+        or json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        != event["payload_json"]
+        or event["event_fingerprint"] != expected_prepare_fingerprint
+        or request["root_id"] != event["root_id"]
+        or request["operation"] != canonical_change["operation"]
+        or request["request_digest"] != canonical_digest
+        or request["prepare_actor"] != event["actor"]
+        or request["prepare_idempotency_key"] != event["idempotency_key"]
+        or request["prepare_fingerprint"] != expected_prepare_fingerprint
+        or request["root_fingerprint"] != sealed_root_fingerprint
+        or request["prepared_state_digest"] != sealed_state_digest
+        or request["prepared_at"] != event["created_at"]
+    ):
+        raise ValueError("program change request integrity check failed")
+
+    applied_events = conn.execute(
+        "SELECT root_id, actor, idempotency_key, event_fingerprint, payload_json, created_at "
+        "FROM program_change_request_events "
+        "WHERE request_id = ? AND event_type = 'applied'",
+        (request["request_id"],),
+    ).fetchall()
+    if request["status"] == "prepared":
+        if applied_events or any(
+            request[field] is not None
+            for field in (
+                "apply_actor",
+                "apply_idempotency_key",
+                "apply_fingerprint",
+                "result_json",
+                "applied_at",
+            )
+        ):
+            raise ValueError("program change request integrity check failed")
+    elif request["status"] == "applied":
+        if len(applied_events) != 1 or not isinstance(request["result_json"], str):
+            raise ValueError("program change request integrity check failed")
+        applied = applied_events[0]
+        _, expected_apply_fingerprint = _sha256_json(
+            {
+                "version": 1,
+                "root_id": event["root_id"],
+                "request_id": event["request_id"],
+                "actor": applied["actor"],
+                "idempotency_key": applied["idempotency_key"],
+            }
+        )
+        if (
+            applied["root_id"] != event["root_id"]
+            or request["apply_actor"] != applied["actor"]
+            or request["apply_idempotency_key"] != applied["idempotency_key"]
+            or request["apply_fingerprint"] != expected_apply_fingerprint
+            or applied["event_fingerprint"] != expected_apply_fingerprint
+            or not hmac.compare_digest(applied["payload_json"], request["result_json"])
+            or request["applied_at"] != applied["created_at"]
+        ):
+            raise ValueError("program change request integrity check failed")
+    else:
+        raise ValueError("program change request integrity check failed")
+    return canonical_change, expected_result
+
+
+def prepare_program_change_request(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    change: dict[str, Any],
+    actor: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Durably prepare a root-bound change against an exact lifecycle snapshot."""
+    if not is_mission_control_command_cgroup():
+        raise ValueError("program lifecycle changes require trusted Mission Control")
+    root_id = _bounded_program_identity(root_id, "root_id")
+    actor = _bounded_program_identity(actor, "actor")
+    idempotency_key = _bounded_program_identity(idempotency_key, "idempotency_key")
+    canonical, change_json, request_digest = _canonical_program_change(change)
+    _, prepare_fingerprint = _sha256_json(
+        {
+            "version": 1,
+            "root_id": root_id,
+            "actor": actor,
+            "idempotency_key": idempotency_key,
+            "request_digest": request_digest,
+        }
+    )
+    request_id = "pcr-" + prepare_fingerprint.removeprefix("sha256:")[:32]
+    now = int(time.time())
+    with write_txn(conn):
+        root = _program_root_row(conn, root_id)
+        policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
+        lifecycle = _ensure_program_lifecycle(conn, root, policy, now)
+        existing_rows = conn.execute(
+            "SELECT * FROM program_change_requests WHERE request_id = ? OR "
+            "(root_id = ? AND prepare_actor = ? AND prepare_idempotency_key = ?)",
+            (request_id, root_id, actor, idempotency_key),
+        ).fetchall()
+        if len(existing_rows) > 1:
+            raise ValueError("program change request integrity check failed")
+        existing = existing_rows[0] if existing_rows else None
+        if existing is not None:
+            _, anchored_result = _verify_prepared_request_anchor(conn, existing)
+            if existing["prepare_fingerprint"] != prepare_fingerprint:
+                raise ValueError("idempotency key request does not match")
+            return {**anchored_result, "status": existing["status"], "replayed": True}
+        if lifecycle["archived_at"] is not None or root["status"] == "archived":
+            raise ValueError("archived program cannot be changed")
+        if canonical["operation"] == "extend_deadline":
+            new_deadline = canonical["new_deadline"]
+            if new_deadline <= now:
+                raise ValueError("new deadline must be in the future")
+            if new_deadline <= int(lifecycle["effective_deadline"]):
+                raise ValueError("new deadline must increase the effective deadline")
+            maximum = int(root["created_at"]) + PROGRAM_MAX_TOTAL_WALL_CLOCK_SECONDS
+            if new_deadline > maximum:
+                raise ValueError("new deadline exceeds maximum program lifetime")
+        prepared_state_digest = _program_state_digest(conn, root, lifecycle)
+        conn.execute(
+            "INSERT INTO program_change_requests ("
+            "request_id, root_id, root_fingerprint, operation, change_json, "
+            "request_digest, prepared_state_digest, prepare_actor, "
+            "prepare_idempotency_key, prepare_fingerprint, status, prepared_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?)",
+            (
+                request_id,
+                root_id,
+                lifecycle["root_fingerprint"],
+                canonical["operation"],
+                change_json,
+                request_digest,
+                prepared_state_digest,
+                actor,
+                idempotency_key,
+                prepare_fingerprint,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM program_change_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        result = _prepared_change_result(row, replayed=False)
+        conn.execute(
+            "INSERT INTO program_change_request_events ("
+            "request_id, root_id, event_type, actor, idempotency_key, "
+            "event_fingerprint, payload_json, created_at) "
+            "VALUES (?, ?, 'prepared', ?, ?, ?, ?, ?)",
+            (
+                request_id,
+                root_id,
+                actor,
+                idempotency_key,
+                prepare_fingerprint,
+                json.dumps(
+                    {
+                        "version": 2,
+                        "request": result,
+                        "root_fingerprint": row["root_fingerprint"],
+                        "prepared_state_digest": row["prepared_state_digest"],
+                        "prepared_at": now,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                now,
+            ),
+        )
+    return result
+
+
+def apply_program_change_request(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    request_id: str,
+    actor: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Apply one prepared change exactly once if its root snapshot is current."""
+    if not is_mission_control_command_cgroup():
+        raise ValueError("program lifecycle changes require trusted Mission Control")
+    root_id = _bounded_program_identity(root_id, "root_id")
+    request_id = _bounded_program_identity(request_id, "request_id")
+    actor = _bounded_program_identity(actor, "actor")
+    idempotency_key = _bounded_program_identity(idempotency_key, "idempotency_key")
+    _, apply_fingerprint = _sha256_json(
+        {
+            "version": 1,
+            "root_id": root_id,
+            "request_id": request_id,
+            "actor": actor,
+            "idempotency_key": idempotency_key,
+        }
+    )
+    now = int(time.time())
+    with write_txn(conn):
+        request = conn.execute(
+            "SELECT * FROM program_change_requests WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        if request is None:
+            raise ValueError("unknown program change request")
+        if request["root_id"] != root_id:
+            raise ValueError("program change request root binding mismatch")
+        canonical_change, _ = _verify_prepared_request_anchor(conn, request)
+        if request["status"] == "applied":
+            if request["apply_fingerprint"] != apply_fingerprint:
+                raise ValueError("program change request was already applied")
+            applied_events = conn.execute(
+                "SELECT actor, idempotency_key, event_fingerprint, payload_json "
+                "FROM program_change_request_events "
+                "WHERE request_id = ? AND event_type = 'applied'",
+                (request_id,),
+            ).fetchall()
+            result_json = request["result_json"]
+            if (
+                len(applied_events) != 1
+                or not isinstance(result_json, str)
+                or request["apply_actor"] != actor
+                or request["apply_idempotency_key"] != idempotency_key
+            ):
+                raise ValueError("program change request integrity check failed")
+            applied_event = applied_events[0]
+            if (
+                applied_event["actor"] != actor
+                or applied_event["idempotency_key"] != idempotency_key
+                or applied_event["event_fingerprint"] != apply_fingerprint
+                or not hmac.compare_digest(applied_event["payload_json"], result_json)
+            ):
+                raise ValueError("program change request integrity check failed")
+            try:
+                result = json.loads(result_json)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise ValueError("program change request integrity check failed") from exc
+            if not isinstance(result, dict) or json.dumps(
+                result, sort_keys=True, separators=(",", ":")
+            ) != result_json:
+                raise ValueError("program change request integrity check failed")
+            common = {
+                "request_id": request_id,
+                "root_id": root_id,
+                "operation": canonical_change["operation"],
+                "status": "applied",
+                "actor": actor,
+                "idempotency_key": idempotency_key,
+                "replayed": False,
+            }
+            if canonical_change["operation"] == "extend_deadline":
+                expected = {
+                    **common,
+                    "effective_deadline": canonical_change["new_deadline"],
+                }
+                if result != expected:
+                    raise ValueError("program change request integrity check failed")
+            else:
+                archived_count = result.get("archived_task_count")
+                if (
+                    set(result) != {*common, "archived_task_count"}
+                    or any(result.get(key) != value for key, value in common.items())
+                    or type(archived_count) is not int
+                    or archived_count < 0
+                ):
+                    raise ValueError("program change request integrity check failed")
+            result["replayed"] = True
+            return result
+        root = _program_root_row(conn, root_id)
+        policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
+        lifecycle = _ensure_program_lifecycle(conn, root, policy, now)
+        if lifecycle["root_fingerprint"] != request["root_fingerprint"]:
+            raise ValueError("program change request root binding mismatch")
+        if _program_state_digest(conn, root, lifecycle) != request["prepared_state_digest"]:
+            raise ValueError("program change request is stale")
+        change = canonical_change
+        operation = request["operation"]
+        lifecycle_key = f"pcr-{request_id[-16:]}-{idempotency_key}"
+        if operation == "extend_deadline":
+            previous = int(lifecycle["effective_deadline"])
+            new_deadline = change["new_deadline"]
+            if new_deadline <= now:
+                raise ValueError("new deadline must be in the future")
+            if new_deadline <= previous:
+                raise ValueError("new deadline must increase the effective deadline")
+            maximum = int(root["created_at"]) + PROGRAM_MAX_TOTAL_WALL_CLOCK_SECONDS
+            if new_deadline > maximum:
+                raise ValueError("new deadline exceeds maximum program lifetime")
+            conn.execute(
+                "UPDATE program_lifecycle SET effective_deadline = ?, updated_at = ? "
+                "WHERE root_id = ?",
+                (new_deadline, now, root_id),
+            )
+            lifecycle_request = {
+                "version": 1,
+                "operation": "deadline_extended",
+                "root_id": root_id,
+                "new_deadline": new_deadline,
+            }
+            _, lifecycle_fingerprint = _sha256_json(lifecycle_request)
+            conn.execute(
+                "INSERT INTO program_lifecycle_events ("
+                "root_id, operation, actor, idempotency_key, request_fingerprint, "
+                "previous_deadline, new_deadline, result_json, created_at) "
+                "VALUES (?, 'deadline_extended', ?, ?, ?, ?, ?, NULL, ?)",
+                (
+                    root_id,
+                    actor,
+                    lifecycle_key,
+                    "v1:" + lifecycle_fingerprint.removeprefix("sha256:"),
+                    previous,
+                    new_deadline,
+                    now,
+                ),
+            )
+            result: dict[str, Any] = {
+                "request_id": request_id,
+                "root_id": root_id,
+                "operation": operation,
+                "status": "applied",
+                "effective_deadline": new_deadline,
+                "actor": actor,
+                "idempotency_key": idempotency_key,
+                "replayed": False,
+            }
+        else:
+            rows = conn.execute(
+                "SELECT id, status FROM tasks WHERE orchestration_root_id = ?",
+                (root_id,),
+            ).fetchall()
+            if not rows or any(row["status"] not in {"done", "archived"} for row in rows):
+                raise ValueError("program must be terminal before archival")
+            archived_count = sum(row["status"] != "archived" for row in rows)
+            conn.execute(
+                "UPDATE tasks SET status = 'archived', "
+                "completed_at = COALESCE(completed_at, ?), claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE orchestration_root_id = ? AND status != 'archived'",
+                (now, root_id),
+            )
+            conn.execute(
+                "UPDATE program_lifecycle SET archived_at = ?, archive_actor = ?, "
+                "updated_at = ? WHERE root_id = ?",
+                (now, actor, now, root_id),
+            )
+            _, lifecycle_fingerprint = _sha256_json(
+                {"version": 1, "operation": "program_archived", "root_id": root_id}
+            )
+            result = {
+                "request_id": request_id,
+                "root_id": root_id,
+                "operation": operation,
+                "status": "applied",
+                "archived_task_count": archived_count,
+                "actor": actor,
+                "idempotency_key": idempotency_key,
+                "replayed": False,
+            }
+            conn.execute(
+                "INSERT INTO program_lifecycle_events ("
+                "root_id, operation, actor, idempotency_key, request_fingerprint, "
+                "result_json, created_at) VALUES (?, 'program_archived', ?, ?, ?, ?, ?)",
+                (
+                    root_id,
+                    actor,
+                    lifecycle_key,
+                    "v1:" + lifecycle_fingerprint.removeprefix("sha256:"),
+                    json.dumps(result, sort_keys=True, separators=(",", ":")),
+                    now,
+                ),
+            )
+        result_json = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        cur = conn.execute(
+            "UPDATE program_change_requests SET status = 'applied', apply_actor = ?, "
+            "apply_idempotency_key = ?, apply_fingerprint = ?, result_json = ?, "
+            "applied_at = ? WHERE request_id = ? AND status = 'prepared'",
+            (actor, idempotency_key, apply_fingerprint, result_json, now, request_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("program change request changed concurrently")
+        conn.execute(
+            "INSERT INTO program_change_request_events ("
+            "request_id, root_id, event_type, actor, idempotency_key, "
+            "event_fingerprint, payload_json, created_at) "
+            "VALUES (?, ?, 'applied', ?, ?, ?, ?, ?)",
+            (
+                request_id,
+                root_id,
+                actor,
+                idempotency_key,
+                apply_fingerprint,
+                result_json,
+                now,
+            ),
+        )
+    return result
+
+
+def extend_program_deadline(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    new_deadline: int,
+    actor: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Monotonically extend a managed program deadline under a hard bound."""
+    if not is_mission_control_command_cgroup():
+        raise ValueError("program lifecycle changes require trusted Mission Control")
+    root_id = _bounded_program_identity(root_id, "root_id")
+    actor = _bounded_program_identity(actor, "actor")
+    idempotency_key = _bounded_program_identity(idempotency_key, "idempotency_key")
+    if type(new_deadline) is not int:
+        raise ValueError("new_deadline must be an integer timestamp")
+    now = int(time.time())
+    with write_txn(conn):
+        root = _program_root_row(conn, root_id)
+        policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
+        lifecycle = _ensure_program_lifecycle(conn, root, policy, now)
+        request_document = json.dumps(
+            {
+                "version": 1,
+                "operation": "deadline_extended",
+                "root_id": root_id,
+                "new_deadline": new_deadline,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request_fingerprint = "v1:" + hashlib.sha256(request_document).hexdigest()
+        existing = conn.execute(
+            "SELECT * FROM program_lifecycle_events "
+            "WHERE root_id = ? AND actor = ? AND idempotency_key = ?",
+            (root_id, actor, idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["operation"] != "deadline_extended"
+                or existing["request_fingerprint"] != request_fingerprint
+            ):
+                raise ValueError("idempotency key request does not match")
+            return {
+                "root_id": root_id,
+                "previous_deadline": int(existing["previous_deadline"]),
+                "effective_deadline": int(existing["new_deadline"]),
+                "actor": actor,
+                "idempotency_key": idempotency_key,
+                "replayed": True,
+            }
+        if lifecycle["archived_at"] is not None or root["status"] == "archived":
+            raise ValueError("archived program deadline cannot be extended")
+        previous = int(lifecycle["effective_deadline"])
+        if new_deadline <= now:
+            raise ValueError("new deadline must be in the future")
+        if new_deadline <= previous:
+            raise ValueError("new deadline must increase the effective deadline")
+        maximum = int(root["created_at"]) + PROGRAM_MAX_TOTAL_WALL_CLOCK_SECONDS
+        if new_deadline > maximum:
+            raise ValueError("new deadline exceeds maximum program lifetime")
+        cur = conn.execute(
+            "UPDATE program_lifecycle SET effective_deadline = ?, updated_at = ? "
+            "WHERE root_id = ? AND effective_deadline = ? AND archived_at IS NULL",
+            (new_deadline, now, root_id, previous),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("program lifecycle changed concurrently")
+        conn.execute(
+            "INSERT INTO program_lifecycle_events ("
+            "root_id, operation, actor, idempotency_key, request_fingerprint, "
+            "previous_deadline, new_deadline, result_json, created_at) "
+            "VALUES (?, 'deadline_extended', ?, ?, ?, ?, ?, NULL, ?)",
+            (
+                root_id,
+                actor,
+                idempotency_key,
+                request_fingerprint,
+                previous,
+                new_deadline,
+                now,
+            ),
+        )
+    return {
+        "root_id": root_id,
+        "previous_deadline": previous,
+        "effective_deadline": new_deadline,
+        "actor": actor,
+        "idempotency_key": idempotency_key,
+        "replayed": False,
+    }
+
+
+def archive_program(
+    conn: sqlite3.Connection,
+    root_id: str,
+    *,
+    actor: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Archive a fully terminal managed program as one audited transition."""
+    if not is_mission_control_command_cgroup():
+        raise ValueError("program lifecycle changes require trusted Mission Control")
+    root_id = _bounded_program_identity(root_id, "root_id")
+    actor = _bounded_program_identity(actor, "actor")
+    idempotency_key = _bounded_program_identity(idempotency_key, "idempotency_key")
+    now = int(time.time())
+    request_document = json.dumps(
+        {"version": 1, "operation": "program_archived", "root_id": root_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request_fingerprint = "v1:" + hashlib.sha256(request_document).hexdigest()
+    with write_txn(conn):
+        root = _program_root_row(conn, root_id)
+        policy = OrchestrationPolicy.from_json(root["orchestration_policy"])
+        lifecycle = _ensure_program_lifecycle(conn, root, policy, now)
+        existing = conn.execute(
+            "SELECT * FROM program_lifecycle_events "
+            "WHERE root_id = ? AND actor = ? AND idempotency_key = ?",
+            (root_id, actor, idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["operation"] != "program_archived"
+                or existing["request_fingerprint"] != request_fingerprint
+            ):
+                raise ValueError("idempotency key request does not match")
+            result = json.loads(existing["result_json"])
+            result["replayed"] = True
+            return result
+        rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE orchestration_root_id = ?",
+            (root_id,),
+        ).fetchall()
+        if not rows or any(row["status"] not in {"done", "archived"} for row in rows):
+            raise ValueError("program must be terminal before archival")
+        archived_count = sum(row["status"] != "archived" for row in rows)
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', completed_at = COALESCE(completed_at, ?), "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE orchestration_root_id = ? AND status != 'archived'",
+            (now, root_id),
+        )
+        cur = conn.execute(
+            "UPDATE program_lifecycle SET archived_at = ?, archive_actor = ?, "
+            "updated_at = ? WHERE root_id = ? AND archived_at IS NULL",
+            (now, actor, now, root_id),
+        )
+        if cur.rowcount != 1 and lifecycle["archived_at"] is None:
+            raise ValueError("program lifecycle changed concurrently")
+        result = {
+            "root_id": root_id,
+            "archived_task_count": archived_count,
+            "actor": actor,
+            "idempotency_key": idempotency_key,
+            "replayed": False,
+        }
+        conn.execute(
+            "INSERT INTO program_lifecycle_events ("
+            "root_id, operation, actor, idempotency_key, request_fingerprint, "
+            "result_json, created_at) VALUES (?, 'program_archived', ?, ?, ?, ?, ?)",
+            (
+                root_id,
+                actor,
+                idempotency_key,
+                request_fingerprint,
+                json.dumps(result, sort_keys=True, separators=(",", ":")),
+                now,
+            ),
+        )
+    return result
+
+
 def _program_deadline(
     conn: sqlite3.Connection, task_id: str, now: int,
 ) -> tuple[Optional[OrchestrationPolicy], Optional[str], bool, str]:
@@ -3912,11 +4937,21 @@ def _program_deadline(
     except ValueError:
         return None, root_id, True, "program_authority_invalid"
     root = conn.execute(
-        "SELECT created_at FROM tasks WHERE id=?", (root_id,),
+        "SELECT t.created_at, l.effective_deadline, l.archived_at "
+        "FROM tasks t LEFT JOIN program_lifecycle l ON l.root_id = t.id "
+        "WHERE t.id = ?",
+        (root_id,),
     ).fetchone()
     if root is None:
         return policy, root_id, True, "program_authority_invalid"
-    expired = now >= int(root["created_at"]) + policy.max_wall_clock_seconds
+    if root["archived_at"] is not None:
+        return policy, root_id, True, "program_archived"
+    deadline = (
+        int(root["effective_deadline"])
+        if root["effective_deadline"] is not None
+        else int(root["created_at"]) + policy.max_wall_clock_seconds
+    )
+    expired = now >= deadline
     return policy, root_id, expired, "program_deadline" if expired else ""
 
 
@@ -7655,7 +8690,8 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = 'transient' "
                     "WHERE id = ? AND status IN ('running', 'ready')",
                     (failures, error[:500], task_id),
                 )
@@ -7665,7 +8701,8 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = 'transient' "
                     "WHERE id = ? AND status IN ('ready', 'running')",
                     (failures, error[:500], task_id),
                 )
