@@ -11,6 +11,10 @@ name: CI
 # through this file.
 
 on:
+  # The maintained fork uses this workflow as an explicit required-check authority.
+  # Manual dispatch provides a bounded recovery path for an exact reviewed ref;
+  # pull_request and main push remain the automatic publication paths.
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
