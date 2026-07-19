@@ -636,23 +636,33 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
 # GC + retention
 # ---------------------------------------------------------------------------
 
-def test_gc_events_keeps_active_task_history(kanban_home):
+def test_gc_events_keeps_active_task_history(kanban_home, monkeypatch):
     """gc_events should only prune rows for terminal (done/archived) tasks."""
     conn = kb.connect()
     try:
         alive = kb.create_task(conn, title="a", assignee="w")
         done_id = kb.create_task(conn, title="b", assignee="w")
-        kb.complete_task(conn, done_id)
-
-        # Force all existing events to "old" by bumping created_at backwards.
+        old_timestamp = int(time.time()) - 60 * 24 * 3600
+        # Existing non-completion events may be aged for this retention fixture.
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE task_events SET created_at = ?",
-                (int(time.time()) - 60 * 24 * 3600,),
+                (old_timestamp,),
             )
+        # Completion evidence is immutable, so create it with the old timestamp
+        # instead of mutating it after publication.
+        real_time = time.time
+        monkeypatch.setattr(kb.time, "time", lambda: old_timestamp)
+        kb.complete_task(conn, done_id)
+        monkeypatch.setattr(kb.time, "time", real_time)
         removed = kb.gc_events(conn, older_than_seconds=30 * 24 * 3600)
-        # At least the done task's "created" + "completed" events gone.
-        assert removed >= 2
+        # Non-evidence history may be pruned, but immutable completion proof
+        # survives retention even for a terminal task.
+        assert removed >= 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='completed'",
+            (done_id,),
+        ).fetchone()[0] == 1
         # Alive task's events survive.
         alive_events = kb.list_events(conn, alive)
         assert len(alive_events) >= 1

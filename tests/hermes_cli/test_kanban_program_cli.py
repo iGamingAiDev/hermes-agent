@@ -381,3 +381,320 @@ def test_program_change_rejection_precedes_database_initialization(
     )
     assert kc.kanban_command(args) == 2
     assert capsys.readouterr().out == ""
+
+
+def test_program_capabilities_emits_exact_mission_contract_without_db_init(
+    tmp_path, mission_control_cgroup, monkeypatch, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(kb, "init_db", lambda *a, **k: pytest.fail("DB initialized"))
+    args = _parse_program("--board default program capabilities --json")
+
+    assert kc.kanban_command(args) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == (
+        '{"contract":"hermes-program-control","board":"default","version":2,'
+        '"schema":2,"operator_visible_decision_briefs":1,"cli":1,'
+        '"dispatcher_gate":1,"classic_worker_boundary":1,'
+        '"goal_loop_boundary":1,"ack_writer":1,"events":1}\n'
+    )
+    assert not (tmp_path / ".hermes" / "kanban.db").exists()
+
+
+def _program_request(argv, document, monkeypatch):
+    monkeypatch.setattr(sys, "stdin", StringIO(json.dumps(document, separators=(",", ":"))))
+    return _parse_program(argv)
+
+
+def test_program_hint_records_versioned_root_bound_hint_and_replays(
+    kanban_home, mission_control_cgroup, monkeypatch, capsys
+):
+    root_id = _create_program_root()
+    document = {
+        "program_id": root_id,
+        "node_id": root_id,
+        "text": "operator context",
+        "expected_node_version": 0,
+        "idempotency_key": "abcdefghijklmnop",
+    }
+    argv = "program hint --request-json-stdin --json"
+    assert kc.kanban_command(_program_request(argv, document, monkeypatch)) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first == {
+        "ok": True,
+        "hint_id": first["hint_id"],
+        "node_id": root_id,
+        "state": "recorded",
+        "node_version": 1,
+        "deduplicated": False,
+    }
+
+    assert kc.kanban_command(_program_request(argv, document, monkeypatch)) == 0
+    replay = json.loads(capsys.readouterr().out)
+    assert replay == {**first, "deduplicated": True}
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM program_operator_hints").fetchone()[0] == 1
+
+
+def test_program_hint_stale_or_idempotency_mismatch_has_no_mutation(
+    kanban_home, mission_control_cgroup, monkeypatch, capsys
+):
+    root_id = _create_program_root()
+    base = {
+        "program_id": root_id,
+        "node_id": root_id,
+        "text": "first",
+        "expected_node_version": 0,
+        "idempotency_key": "abcdefghijklmnop",
+    }
+    argv = "program hint --request-json-stdin --json"
+    assert kc.kanban_command(_program_request(argv, base, monkeypatch)) == 0
+    capsys.readouterr()
+    assert kc.kanban_command(
+        _program_request(argv, {**base, "text": "different"}, monkeypatch)
+    ) != 0
+    assert kc.kanban_command(
+        _program_request(
+            argv,
+            {**base, "idempotency_key": "ponmlkjihgfedcba"},
+            monkeypatch,
+        )
+    ) != 0
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM program_operator_hints").fetchone()[0] == 1
+
+
+def test_program_decision_select_is_cas_option_bound_and_idempotent(
+    kanban_home, mission_control_cgroup, monkeypatch, capsys
+):
+    root_id = _create_program_root()
+    with kb.connect() as conn:
+        kb.create_program_decision_checkpoint(
+            conn,
+            root_id,
+            "decision-1",
+            node_id=root_id,
+            recommended_option_id="option-1",
+            title="Choose delivery path",
+            recommendation_rationale="Option one minimizes operational risk.",
+            options=(
+                {
+                    "option_id": "option-1", "label": "Path one", "summary": "First path",
+                    "benefits": ["Lower risk"], "risks": ["Slower"],
+                    "reversibility": "reversible", "security_impact": "None",
+                    "cost_impact": "Low", "operations_impact": "Low",
+                },
+                {
+                    "option_id": "option-2", "label": "Path two", "summary": "Second path",
+                    "benefits": ["Faster"], "risks": ["Higher risk"],
+                    "reversibility": "partially_reversible", "security_impact": "Review",
+                    "cost_impact": "Medium", "operations_impact": "Medium",
+                },
+            ),
+        )
+    document = {
+        "root_id": root_id,
+        "checkpoint_id": "decision-1",
+        "option_id": "option-2",
+        "expected_version": 1,
+        "idempotency_key": "abcdefghijklmnop",
+        "actor": "control:owner",
+    }
+    argv = "program decision select --request-json-stdin --json"
+    assert kc.kanban_command(_program_request(argv, document, monkeypatch)) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first == {
+        "ok": True,
+        "checkpoint_id": "decision-1",
+        "state": "selected",
+        "version": 2,
+        "selected_option_id": "option-2",
+        "deduplicated": False,
+    }
+    assert kc.kanban_command(_program_request(argv, document, monkeypatch)) == 0
+    assert json.loads(capsys.readouterr().out) == {**first, "deduplicated": True}
+
+
+def test_program_hint_state_rollback_cannot_authorize_duplicate_transition(
+    kanban_home, mission_control_cgroup
+):
+    root_id = _create_program_root()
+    first = {
+        "program_id": root_id,
+        "node_id": root_id,
+        "text": "first",
+        "expected_node_version": 0,
+        "idempotency_key": "abcdefghijklmnop",
+    }
+    with kb.connect() as conn:
+        kb.record_program_operator_hint(conn, first)
+        conn.execute(
+            "UPDATE tasks SET program_control_version=0 WHERE id=?", (root_id,)
+        )
+        with pytest.raises(ValueError, match="integrity"):
+            kb.record_program_operator_hint(
+                conn,
+                {**first, "text": "second", "idempotency_key": "ponmlkjihgfedcba"},
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM program_operator_hints"
+        ).fetchone()[0] == 1
+
+
+def test_program_hint_history_cap_rejects_new_transition_but_preserves_replay(
+    kanban_home, mission_control_cgroup
+):
+    root_id = _create_program_root()
+    with kb.connect() as conn:
+        conn.executemany(
+            "INSERT INTO program_operator_hints "
+            "(hint_id,root_id,node_id,text,expected_version,resulting_version,idempotency_key,"
+            "request_fingerprint,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                (
+                    f"synthetic-{index}", root_id, root_id, "seed", index, index + 1,
+                    f"synthetic-key-{index}", f"sha256:{index:064x}", 1_700_000_000,
+                )
+                for index in range(9_999)
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET program_control_version=9999 WHERE id=?", (root_id,)
+        )
+        final = {
+            "program_id": root_id,
+            "node_id": root_id,
+            "text": "last supported hint",
+            "expected_node_version": 9_999,
+            "idempotency_key": "abcdefghijklmnop",
+        }
+        first = kb.record_program_operator_hint(conn, final)
+        assert first["node_version"] == 10_000
+        replay = kb.record_program_operator_hint(conn, final)
+        assert replay == {**first, "deduplicated": True}
+        with pytest.raises(ValueError, match="capacity"):
+            kb.record_program_operator_hint(
+                conn,
+                {
+                    **final,
+                    "expected_node_version": 10_000,
+                    "idempotency_key": "ponmlkjihgfedcba",
+                },
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM program_operator_hints"
+        ).fetchone()[0] == 10_000
+
+
+def _decision_options():
+    return (
+        {
+            "option_id": "option-1", "label": "Path one", "summary": "First path",
+            "benefits": ["Lower risk"], "risks": ["Slower"],
+            "reversibility": "reversible", "security_impact": "None",
+            "cost_impact": "Low", "operations_impact": "Low",
+        },
+        {
+            "option_id": "option-2", "label": "Path two", "summary": "Second path",
+            "benefits": ["Faster"], "risks": ["Higher risk"],
+            "reversibility": "partially_reversible", "security_impact": "Review",
+            "cost_impact": "Medium", "operations_impact": "Medium",
+        },
+    )
+
+
+def _create_decision(conn, root_id, checkpoint_id="decision-1", **overrides):
+    values = {
+        "node_id": root_id,
+        "recommended_option_id": "option-1",
+        "title": "Choose delivery path",
+        "recommendation_rationale": "Option one minimizes operational risk.",
+        "options": _decision_options(),
+    }
+    values.update(overrides)
+    kb.create_program_decision_checkpoint(conn, root_id, checkpoint_id, **values)
+
+
+def test_program_decision_state_rollback_cannot_authorize_second_selection(
+    kanban_home, mission_control_cgroup
+):
+    root_id = _create_program_root()
+    first = {
+        "root_id": root_id,
+        "checkpoint_id": "decision-1",
+        "option_id": "option-1",
+        "expected_version": 1,
+        "idempotency_key": "abcdefghijklmnop",
+        "actor": "control:owner",
+    }
+    with kb.connect() as conn:
+        _create_decision(conn, root_id)
+        kb.select_program_decision(conn, first)
+        conn.execute(
+            "UPDATE program_decisions SET state='pending',version=1,selected_option_id=NULL "
+            "WHERE root_id=? AND checkpoint_id='decision-1'",
+            (root_id,),
+        )
+        with pytest.raises(ValueError, match="integrity"):
+            kb.select_program_decision(
+                conn,
+                {**first, "option_id": "option-2", "idempotency_key": "ponmlkjihgfedcba"},
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM program_decision_events"
+        ).fetchone()[0] == 1
+
+
+def test_checkpoint_producer_matches_mission_public_projection_bounds(
+    kanban_home, mission_control_cgroup
+):
+    root_id = _create_program_root()
+    base = list(_decision_options())
+    invalid = [
+        {"options": base[:1]},
+        {"options": base + [{**base[0], "option_id": f"option-{index}"} for index in range(3, 6)]},
+        {"title": "e\u0301"},
+        {"options": [{**base[0], "benefits": ["same", "same"]}, base[1]]},
+        {"options": [{**base[0], "risks": [str(index) for index in range(11)]}, base[1]]},
+        {"options": [{**base[0], "benefits": ["e\u0301"]}, base[1]]},
+    ]
+    with kb.connect() as conn:
+        for index, overrides in enumerate(invalid):
+            with pytest.raises(ValueError):
+                _create_decision(conn, root_id, f"invalid-{index}", **overrides)
+        assert conn.execute("SELECT COUNT(*) FROM program_decisions").fetchone()[0] == 0
+
+
+def test_program_schema_preflight_rejects_owned_namespace_debris(
+    kanban_home, mission_control_cgroup, monkeypatch
+):
+    with kb.connect() as conn:
+        conn.execute("CREATE TABLE program_phase2_debris(value TEXT)")
+    monkeypatch.setattr(kb, "_INITIALIZED_PATHS", set())
+    with pytest.raises(ValueError, match="unsupported program lifecycle schema"):
+        kb.connect()
+
+
+@pytest.mark.parametrize(
+    "argv,document",
+    [
+        (
+            "program hint --request-json-stdin --json",
+            {"program_id": "p", "node_id": "n", "text": "x", "expected_node_version": 0,
+             "idempotency_key": "abcdefghijklmnop", "extra": True},
+        ),
+        (
+            "program decision select --request-json-stdin --json",
+            {"root_id": "p", "checkpoint_id": "c", "option_id": "o", "expected_version": 0,
+             "idempotency_key": "abcdefghijklmnop", "actor": "owner"},
+        ),
+    ],
+)
+def test_program_control_rejects_strict_request_before_db_initialization(
+    tmp_path, mission_control_cgroup, monkeypatch, capsys, argv, document
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(kb, "init_db", lambda *a, **k: pytest.fail("DB initialized"))
+    assert kc.kanban_command(_program_request(argv, document, monkeypatch)) == 2
+    assert capsys.readouterr().out == ""
